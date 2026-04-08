@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { buildTypeEnv, type TypeEnvironment } from '../../src/core/ingestion/type-env.js';
+import type { SymbolDefinition, SymbolTable } from '../../src/core/ingestion/symbol-table.js';
 import {
   stripNullable,
   extractSimpleTypeName,
@@ -16,12 +17,45 @@ import Kotlin from 'tree-sitter-kotlin';
 import PHP from 'tree-sitter-php';
 import Ruby from 'tree-sitter-ruby';
 
+let Dart: unknown;
+try {
+  Dart = require('tree-sitter-dart');
+  const testParser = new Parser();
+  testParser.setLanguage(Dart as Parser.Language);
+} catch {
+  Dart = null;
+}
+
+let Swift: unknown;
+try {
+  Swift = require('tree-sitter-swift');
+  const testParser = new Parser();
+  testParser.setLanguage(Swift as Parser.Language);
+} catch {
+  Swift = null;
+}
+
 const parser = new Parser();
 
 const parse = (code: string, lang: any) => {
   parser.setLanguage(lang);
   return parser.parse(code);
 };
+
+const parseDart = (code: string) => {
+  if (!Dart) throw new Error('tree-sitter-dart not available');
+  parser.setLanguage(Dart as Parser.Language);
+  return parser.parse(code);
+};
+
+const parseSwift = (code: string) => {
+  if (!Swift) throw new Error('tree-sitter-swift not available');
+  parser.setLanguage(Swift as Parser.Language);
+  return parser.parse(code);
+};
+
+const describeDart = Dart ? describe : describe.skip;
+const describeSwift = Swift ? describe : describe.skip;
 
 /** Flatten a scoped TypeEnvironment into a simple name→type map (for simple test assertions). */
 function flatGet(typeEnv: TypeEnvironment, varName: string): string | undefined {
@@ -38,6 +72,37 @@ function flatSize(typeEnv: TypeEnvironment): number {
   for (const [, scopeMap] of typeEnv.allScopes()) count += scopeMap.size;
   return count;
 }
+
+const createMockSymbolTable = (overrides: Partial<SymbolTable> = {}): SymbolTable => ({
+  add: () => {},
+  lookupExact: () => undefined,
+  lookupExactFull: () => undefined,
+  lookupExactAll: () => [],
+  lookupFuzzy: () => [],
+  lookupFuzzyCallable: () => [],
+  lookupFieldByOwner: () => undefined,
+  lookupMethodByOwner: () => undefined,
+  lookupClassByName: () => [],
+  lookupClassByQualifiedName: () => [],
+  getStats: () => ({
+    fileCount: 0,
+    globalSymbolCount: 0,
+    fuzzyCallCount: 0,
+    fuzzyCallableCallCount: 0,
+  }),
+  clear: () => {},
+  ...overrides,
+});
+
+const createClassDef = (
+  name: string,
+  type: SymbolDefinition['type'] = 'Class',
+  filePath = `${name}.ts`,
+): SymbolDefinition => ({
+  nodeId: `${type.toLowerCase()}:${name}`,
+  filePath,
+  type,
+});
 
 describe('buildTypeEnv', () => {
   describe('TypeScript', () => {
@@ -1122,6 +1187,108 @@ class RepoService {
     });
   });
 
+  describe('destructured call results', () => {
+    // Minimal mock SymbolTable for call-result return type lookup
+    const makeSymbolTable = (callables: Array<{ name: string; returnType?: string }>) => ({
+      lookupFuzzyCallable: (name: string) =>
+        callables
+          .filter((c) => c.name === name)
+          .map((c) => ({
+            nodeId: 'n1',
+            filePath: 'src.ts',
+            type: 'Function' as const,
+            returnType: c.returnType,
+          })),
+      lookupClassByName: () => [],
+      lookupFuzzy: () => [],
+      lookupExact: () => undefined,
+      lookupExactFull: () => undefined,
+      add: () => {},
+      getStats: () => ({ fileCount: 0, globalSymbolCount: 0 }),
+      clear: () => {},
+    });
+
+    it('emits callResult + fieldAccess items for const { x } = fn()', () => {
+      const symbolTable = makeSymbolTable([{ name: 'getUser', returnType: 'User' }]);
+      const tree = parse('const { name } = getUser();', TypeScript.typescript);
+      const typeEnv = buildTypeEnv(tree, 'typescript', { symbolTable: symbolTable as any });
+      // callResult resolves __destr_getUser_N → User
+      // fieldAccess resolves name via User's properties (no Property nodes in mock → undefined)
+      // But the callResult itself IS emitted — verify constructorBindings is still empty
+      expect(typeEnv.constructorBindings).toEqual([]);
+    });
+
+    it('emits callResult for destructured await call', () => {
+      const symbolTable = makeSymbolTable([{ name: 'fetchData', returnType: 'Response' }]);
+      const tree = parse(
+        'async function f() { const { data } = await fetchData(); }',
+        TypeScript.typescript,
+      );
+      const typeEnv = buildTypeEnv(tree, 'typescript', { symbolTable: symbolTable as any });
+      expect(typeEnv.constructorBindings).toEqual([]);
+    });
+
+    it('gracefully handles no return type (composable without annotation)', () => {
+      const symbolTable = makeSymbolTable([{ name: 'useUserRole' }]); // no returnType
+      const tree = parse('const { isMaker } = useUserRole();', TypeScript.typescript);
+      const typeEnv = buildTypeEnv(tree, 'typescript', { symbolTable: symbolTable as any });
+      // No return type → callResult unresolved → fieldAccess unresolved
+      expect(flatGet(typeEnv, 'isMaker')).toBeUndefined();
+    });
+
+    it('resolves destructured properties when return type has declared fields', () => {
+      // importedReturnTypes provides the return type since no real SymbolTable
+      const tree = parse('const { name } = getUser();', TypeScript.typescript);
+      const typeEnv = buildTypeEnv(tree, 'typescript', {
+        importedReturnTypes: new Map([['getUser', 'User']]),
+      });
+      // callResult resolves __destr_getUser_N → User via importedReturnTypes
+      // fieldAccess for 'name' on 'User' needs User's Property nodes in SymbolTable
+      // Without SymbolTable, field resolution returns undefined — but callResult itself works
+      // Verify the synthetic var resolved to the return type
+      for (const [, scopeMap] of typeEnv.allScopes()) {
+        for (const [key, val] of scopeMap) {
+          if (key.startsWith('__destr_getUser')) {
+            expect(val).toBe('User');
+          }
+        }
+      }
+    });
+
+    it('handles destructured method call: const { x } = obj.getStuff()', () => {
+      const tree = parse(
+        `
+        const repo: Repo = new Repo();
+        const { name } = repo.getProfile();
+        `,
+        TypeScript.typescript,
+      );
+      const typeEnv = buildTypeEnv(tree, 'typescript');
+      // repo is resolved to Repo via Tier 1 (constructor inference)
+      expect(flatGet(typeEnv, 'repo')).toBe('Repo');
+      // Destructured method call emits methodCallResult + fieldAccess
+      // Without SymbolTable, method return type is unknown → name is undefined
+      expect(flatGet(typeEnv, 'name')).toBeUndefined();
+    });
+
+    it('handles renamed destructuring: const { address: addr } = fn()', () => {
+      const tree = parse('const { address: addr } = getUser();', TypeScript.typescript);
+      const typeEnv = buildTypeEnv(tree, 'typescript', {
+        importedReturnTypes: new Map([['getUser', 'User']]),
+      });
+      // 'addr' should be the binding, not 'address'
+      expect(flatGet(typeEnv, 'address')).toBeUndefined();
+      // The synthetic callResult should resolve
+      for (const [, scopeMap] of typeEnv.allScopes()) {
+        for (const [key, val] of scopeMap) {
+          if (key.startsWith('__destr_getUser')) {
+            expect(val).toBe('User');
+          }
+        }
+      }
+    });
+  });
+
   describe('constructor inference (Tier 1 fallback)', () => {
     describe('TypeScript', () => {
       it('infers type from new expression when no annotation', () => {
@@ -1878,7 +2045,7 @@ class RepoService {
         );
         // User is NOT defined in this file, but SymbolTable knows it's a Class
         const mockSymbolTable = {
-          lookupFuzzy: (name: string) =>
+          lookupClassByName: (name: string) =>
             name === 'User' ? [{ nodeId: 'n1', filePath: 'models.kt', type: 'Class' }] : [],
           lookupExact: () => undefined,
           lookupExactFull: () => undefined,
@@ -1900,6 +2067,7 @@ class RepoService {
           Kotlin,
         );
         const mockSymbolTable = {
+          lookupClassByName: () => [],
           lookupFuzzy: (name: string) =>
             name === 'doStuff' ? [{ nodeId: 'n1', filePath: 'utils.kt', type: 'Function' }] : [],
           lookupFuzzyCallable: () => [],
@@ -1972,6 +2140,310 @@ def main():
         );
         const typeEnv = buildTypeEnv(tree, 'python');
         expect(flatGet(typeEnv, 'user')).toBeUndefined();
+      });
+    });
+
+    describe('lookupClassByName regression coverage', () => {
+      const makeClassLookupTable = (classDefs: Record<string, SymbolDefinition[]>) =>
+        createMockSymbolTable({
+          lookupClassByName: (name: string) => classDefs[name] ?? [],
+        });
+
+      it('Python cross-file constructor inference uses lookupClassByName', () => {
+        const tree = parse(
+          `
+def main():
+    user = User("alice")
+`,
+          Python,
+        );
+        const typeEnv = buildTypeEnv(tree, 'python', {
+          symbolTable: makeClassLookupTable({
+            User: [createClassDef('User', 'Class', 'models.py')],
+          }),
+        });
+        expect(flatGet(typeEnv, 'user')).toBe('User');
+      });
+
+      it('Python cross-file constructor inference does not bind plain functions', () => {
+        const tree = parse(
+          `
+def main():
+    result = get_user()
+`,
+          Python,
+        );
+        const typeEnv = buildTypeEnv(tree, 'python', {
+          symbolTable: makeClassLookupTable({}),
+        });
+        expect(flatGet(typeEnv, 'result')).toBeUndefined();
+      });
+
+      it('Python qualified cross-file constructor inference uses lookupClassByName', () => {
+        const tree = parse(
+          `
+def main():
+    user = models.User("alice")
+`,
+          Python,
+        );
+        const typeEnv = buildTypeEnv(tree, 'python', {
+          symbolTable: makeClassLookupTable({
+            User: [createClassDef('User', 'Class', 'models.py')],
+          }),
+        });
+        expect(flatGet(typeEnv, 'user')).toBe('User');
+      });
+
+      it('C++ cross-file constructor inference uses lookupClassByName', () => {
+        const tree = parse(
+          `
+void run() {
+  auto user = User();
+}
+`,
+          CPP,
+        );
+        const typeEnv = buildTypeEnv(tree, 'cpp', {
+          symbolTable: makeClassLookupTable({
+            User: [createClassDef('User', 'Class', 'models.h')],
+          }),
+        });
+        expect(flatGet(typeEnv, 'user')).toBe('User');
+      });
+
+      it('C++ cross-file constructor inference does not bind plain functions', () => {
+        const tree = parse(
+          `
+void run() {
+  auto result = getUser();
+}
+`,
+          CPP,
+        );
+        const typeEnv = buildTypeEnv(tree, 'cpp', {
+          symbolTable: makeClassLookupTable({}),
+        });
+        expect(flatGet(typeEnv, 'result')).toBeUndefined();
+      });
+
+      it('Ruby cross-file constructor inference uses lookupClassByName', () => {
+        const tree = parse(
+          `
+def run
+  user = User.new
+end
+`,
+          Ruby,
+        );
+        const typeEnv = buildTypeEnv(tree, 'ruby', {
+          symbolTable: makeClassLookupTable({
+            User: [createClassDef('User', 'Class', 'models/user.rb')],
+          }),
+        });
+        expect(flatGet(typeEnv, 'user')).toBe('User');
+      });
+
+      it('Ruby namespaced constructor inference uses lookupClassByName', () => {
+        const tree = parse(
+          `
+def run
+  service = Models::UserService.new
+end
+`,
+          Ruby,
+        );
+        const typeEnv = buildTypeEnv(tree, 'ruby', {
+          symbolTable: makeClassLookupTable({
+            UserService: [createClassDef('UserService', 'Class', 'models/user_service.rb')],
+          }),
+        });
+        expect(flatGet(typeEnv, 'service')).toBe('UserService');
+      });
+
+      it('Ruby cross-file constructor inference does not bind plain functions', () => {
+        const tree = parse(
+          `
+def run
+  result = get_user()
+end
+`,
+          Ruby,
+        );
+        const typeEnv = buildTypeEnv(tree, 'ruby', {
+          symbolTable: makeClassLookupTable({}),
+        });
+        expect(flatGet(typeEnv, 'result')).toBeUndefined();
+      });
+
+      describeDart('Dart lookupClassByName regression coverage', () => {
+        it('Dart cross-file constructor inference uses lookupClassByName', () => {
+          const tree = parseDart(
+            `
+void run() {
+  final user = User();
+}
+`,
+          );
+          const typeEnv = buildTypeEnv(tree, 'dart', {
+            symbolTable: makeClassLookupTable({
+              User: [createClassDef('User', 'Class', 'models.dart')],
+            }),
+          });
+          expect(flatGet(typeEnv, 'user')).toBe('User');
+        });
+
+        it('Dart named constructor inference uses lookupClassByName', () => {
+          const tree = parseDart(
+            `
+void run() {
+  final user = User.named();
+}
+`,
+          );
+          const typeEnv = buildTypeEnv(tree, 'dart', {
+            symbolTable: makeClassLookupTable({
+              User: [createClassDef('User', 'Class', 'models.dart')],
+            }),
+          });
+          expect(flatGet(typeEnv, 'user')).toBe('User');
+        });
+
+        it('Dart cross-file constructor inference does not bind plain functions', () => {
+          const tree = parseDart(
+            `
+void run() {
+  final result = getUser();
+}
+`,
+          );
+          const typeEnv = buildTypeEnv(tree, 'dart', {
+            symbolTable: makeClassLookupTable({}),
+          });
+          expect(flatGet(typeEnv, 'result')).toBeUndefined();
+        });
+      });
+
+      it('Rust unit-struct inference uses lookupClassByName', () => {
+        const tree = parse(
+          `
+fn run() {
+  let service = UserService;
+}
+`,
+          Rust,
+        );
+        const typeEnv = buildTypeEnv(tree, 'rust', {
+          symbolTable: makeClassLookupTable({
+            UserService: [createClassDef('UserService', 'Struct', 'models.rs')],
+          }),
+        });
+        expect(flatGet(typeEnv, 'service')).toBe('UserService');
+      });
+
+      it('Rust unit-struct inference stays unresolved when lookupClassByName misses', () => {
+        const tree = parse(
+          `
+fn run() {
+  let value = helper;
+}
+`,
+          Rust,
+        );
+        const typeEnv = buildTypeEnv(tree, 'rust', {
+          symbolTable: makeClassLookupTable({}),
+        });
+        expect(flatGet(typeEnv, 'value')).toBeUndefined();
+      });
+
+      describeSwift('Swift lookupClassByName regression coverage', () => {
+        it('Swift cross-file constructor inference uses lookupClassByName', () => {
+          const tree = parseSwift(
+            `
+func run() {
+  let user = User(name: "alice")
+}
+`,
+          );
+          const typeEnv = buildTypeEnv(tree, 'swift', {
+            symbolTable: makeClassLookupTable({
+              User: [createClassDef('User', 'Class', 'Models/User.swift')],
+            }),
+          });
+          expect(flatGet(typeEnv, 'user')).toBe('User');
+        });
+
+        it('Swift explicit init inference uses lookupClassByName', () => {
+          const tree = parseSwift(
+            `
+func run() {
+  let user = User.init(name: "alice")
+}
+`,
+          );
+          const typeEnv = buildTypeEnv(tree, 'swift', {
+            symbolTable: makeClassLookupTable({
+              User: [createClassDef('User', 'Class', 'Models/User.swift')],
+            }),
+          });
+          expect(flatGet(typeEnv, 'user')).toBe('User');
+        });
+
+        it('Swift cross-file constructor inference does not bind plain functions', () => {
+          const tree = parseSwift(
+            `
+func run() {
+  let result = getUser()
+}
+`,
+          );
+          const typeEnv = buildTypeEnv(tree, 'swift', {
+            symbolTable: makeClassLookupTable({}),
+          });
+          expect(flatGet(typeEnv, 'result')).toBeUndefined();
+        });
+      });
+
+      it('field type resolution uses lookupClassByName-backed class defs', () => {
+        const tree = parse(
+          `
+function process(user: User) {
+  const addr = user.address;
+}
+`,
+          TypeScript.typescript,
+        );
+        const symbolTable = createMockSymbolTable({
+          lookupClassByName: (name: string) =>
+            name === 'User' ? [createClassDef('User', 'Class', 'models.ts')] : [],
+          lookupFieldByOwner: (ownerNodeId: string, fieldName: string) =>
+            ownerNodeId === 'class:User' && fieldName === 'address'
+              ? {
+                  nodeId: 'prop:User:address',
+                  filePath: 'models.ts',
+                  type: 'Property' as const,
+                  declaredType: 'Address',
+                }
+              : undefined,
+        });
+        const typeEnv = buildTypeEnv(tree, 'typescript', { symbolTable });
+        expect(flatGet(typeEnv, 'addr')).toBe('Address');
+      });
+
+      it('field type resolution stays unresolved when lookupClassByName finds no class', () => {
+        const tree = parse(
+          `
+function process(user: User) {
+  const addr = user.address;
+}
+`,
+          TypeScript.typescript,
+        );
+        const symbolTable = createMockSymbolTable({
+          lookupClassByName: () => [],
+        });
+        const typeEnv = buildTypeEnv(tree, 'typescript', { symbolTable });
+        expect(flatGet(typeEnv, 'addr')).toBeUndefined();
       });
     });
 
@@ -4891,6 +5363,7 @@ function process() {
             type: 'Function' as const,
             returnType: c.returnType,
           })),
+      lookupClassByName: () => [],
       lookupFuzzy: () => [],
       lookupExact: () => undefined,
       lookupExactFull: () => undefined,

@@ -11,6 +11,9 @@ export const TYPESCRIPT_QUERIES = `
 (class_declaration
   name: (type_identifier) @name) @definition.class
 
+(abstract_class_declaration
+  name: (type_identifier) @name) @definition.class
+
 (interface_declaration
   name: (type_identifier) @name) @definition.interface
 
@@ -346,6 +349,7 @@ export const JAVA_QUERIES = `
 ; Calls
 (method_invocation name: (identifier) @call.name) @call
 (method_invocation object: (_) name: (identifier) @call.name) @call
+(method_reference) @call
 
 ; Constructor calls: new Foo()
 (object_creation_expression type: (type_identifier) @call.name) @call
@@ -631,6 +635,7 @@ export const CSHARP_QUERIES = `
 export const RUST_QUERIES = `
 ; Functions & Items
 (function_item name: (identifier) @name) @definition.function
+(function_signature_item name: (identifier) @name) @definition.function
 (struct_item name: (type_identifier) @name) @definition.struct
 (enum_item name: (type_identifier) @name) @definition.enum
 (trait_item name: (type_identifier) @name) @definition.trait
@@ -1121,6 +1126,13 @@ export const DART_QUERIES = `
   value: (identifier) @call.name
   (selector (argument_part))) @call
 
+; ── Calls: member calls in variable assignments (var x = obj.method()) ──────
+(initialized_variable_definition
+  (selector
+    (unconditional_assignable_selector
+      (identifier) @call.name))
+  (selector (argument_part))) @call
+
 ; ── Re-exports (export 'foo.dart') ───────────────────────────────────────────
 (import_or_export
   (library_export
@@ -1179,5 +1191,6 @@ export const LANGUAGE_QUERIES: Record<SupportedLanguages, string> = {
   [SupportedLanguages.Ruby]: RUBY_QUERIES,
   [SupportedLanguages.Swift]: SWIFT_QUERIES,
   [SupportedLanguages.Dart]: DART_QUERIES,
+  [SupportedLanguages.Vue]: TYPESCRIPT_QUERIES, // Vue <script> blocks are parsed as TypeScript
   [SupportedLanguages.Cobol]: '', // Standalone regex processor — no tree-sitter queries
 };

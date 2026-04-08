@@ -7,6 +7,7 @@
  */
 
 import { SupportedLanguages } from 'gitnexus-shared';
+import { createClassExtractor } from '../class-extractors/generic.js';
 import { defineLanguage } from '../language-provider.js';
 import { typeConfig as phpConfig } from '../type-extractors/php.js';
 import { phpExportChecker } from '../export-detection.js';
@@ -17,6 +18,8 @@ import { findDescendant, extractStringContent, type SyntaxNode } from '../utils/
 import type { NodeLabel } from 'gitnexus-shared';
 import { createFieldExtractor } from '../field-extractors/generic.js';
 import { phpConfig as phpFieldConfig } from '../field-extractors/configs/php.js';
+import { createMethodExtractor } from '../method-extractors/generic.js';
+import { phpMethodConfig } from '../method-extractors/configs/php.js';
 
 const BUILT_INS: ReadonlySet<string> = new Set([
   'echo',
@@ -231,6 +234,12 @@ export const phpProvider = defineLanguage({
   importResolver: resolvePhpImport,
   namedBindingExtractor: extractPhpNamedBindings,
   fieldExtractor: createFieldExtractor(phpFieldConfig),
+  methodExtractor: createMethodExtractor(phpMethodConfig),
+  classExtractor: createClassExtractor({
+    language: SupportedLanguages.PHP,
+    typeDeclarationNodes: ['class_declaration', 'interface_declaration', 'enum_declaration'],
+    ancestorScopeNodeTypes: ['namespace_definition'],
+  }),
   descriptionExtractor: phpDescriptionExtractor,
   isRouteFile: isPhpRouteFile,
   builtInNames: BUILT_INS,

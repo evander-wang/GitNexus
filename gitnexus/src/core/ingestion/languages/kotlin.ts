@@ -8,6 +8,7 @@
  */
 
 import { SupportedLanguages } from 'gitnexus-shared';
+import { createClassExtractor } from '../class-extractors/generic.js';
 import { defineLanguage } from '../language-provider.js';
 import { kotlinTypeConfig } from '../type-extractors/jvm.js';
 import { kotlinExportChecker } from '../export-detection.js';
@@ -15,11 +16,25 @@ import { resolveKotlinImport } from '../import-resolvers/jvm.js';
 import { extractKotlinNamedBindings } from '../named-bindings/kotlin.js';
 import { appendKotlinWildcard } from '../import-resolvers/jvm.js';
 import { KOTLIN_QUERIES } from '../tree-sitter-queries.js';
-import { isKotlinClassMethod } from '../utils/ast-helpers.js';
+import type { SyntaxNode } from '../utils/ast-helpers.js';
 import { createFieldExtractor } from '../field-extractors/generic.js';
 import { kotlinConfig } from '../field-extractors/configs/jvm.js';
 import { createMethodExtractor } from '../method-extractors/generic.js';
 import { kotlinMethodConfig } from '../method-extractors/configs/jvm.js';
+
+/** Check if a Kotlin function_declaration capture is inside a class_body (i.e., a method).
+ *  Kotlin grammar uses function_declaration for both top-level functions and class methods.
+ *  Returns true when the captured definition node has a class_body ancestor. */
+function isKotlinClassMethod(
+  captureNode: { parent?: SyntaxNode | null } | null | undefined,
+): boolean {
+  let ancestor = captureNode?.parent;
+  while (ancestor) {
+    if (ancestor.type === 'class_body') return true;
+    ancestor = ancestor.parent;
+  }
+  return false;
+}
 
 const BUILT_INS: ReadonlySet<string> = new Set([
   'println',
@@ -92,6 +107,16 @@ export const kotlinProvider = defineLanguage({
   mroStrategy: 'implements-split',
   fieldExtractor: createFieldExtractor(kotlinConfig),
   methodExtractor: createMethodExtractor(kotlinMethodConfig),
+  classExtractor: createClassExtractor({
+    language: SupportedLanguages.Kotlin,
+    typeDeclarationNodes: ['class_declaration', 'object_declaration', 'companion_object'],
+    fileScopeNodeTypes: ['package_header'],
+    ancestorScopeNodeTypes: ['class_declaration', 'object_declaration', 'companion_object'],
+    extractType(node) {
+      if (node.type !== 'class_declaration') return undefined;
+      return node.children.some((child) => child?.text === 'interface') ? 'Interface' : 'Class';
+    },
+  }),
   builtInNames: BUILT_INS,
   labelOverride: (functionNode, defaultLabel) => {
     if (defaultLabel !== 'Function') return defaultLabel;

@@ -1,8 +1,8 @@
 import {
   type SyntaxNode,
   FUNCTION_NODE_TYPES,
-  extractFunctionName,
   CLASS_CONTAINER_TYPES,
+  genericFuncName,
 } from './utils/ast-helpers.js';
 import { CALL_EXPRESSION_TYPES } from './utils/call-analysis.js';
 import { SupportedLanguages } from 'gitnexus-shared';
@@ -132,6 +132,7 @@ const lookupInEnv = (
   callNode: SyntaxNode,
   patternOverrides?: PatternOverrides,
   enclosingFunctionFinder?: (n: SyntaxNode) => { funcName: string; label: NodeLabel } | null,
+  extractFunctionNameHook?: (n: SyntaxNode) => { funcName: string | null; label: NodeLabel } | null,
 ): string | undefined => {
   // Self/this receiver: resolve to enclosing class name via AST walk
   if (varName === 'self' || varName === 'this' || varName === '$this') {
@@ -145,7 +146,11 @@ const lookupInEnv = (
   }
 
   // Determine the enclosing function scope for the call
-  const scopeKey = findEnclosingScopeKey(callNode, enclosingFunctionFinder);
+  const scopeKey = findEnclosingScopeKey(
+    callNode,
+    enclosingFunctionFinder,
+    extractFunctionNameHook,
+  );
 
   // Check position-indexed pattern overrides first (e.g., Kotlin when/is smart casts).
   // These take priority over flat scopeEnv because they represent per-branch narrowing.
@@ -361,11 +366,12 @@ const extractParentClassFromNode = (classNode: SyntaxNode): string | undefined =
 const findEnclosingScopeKey = (
   node: SyntaxNode,
   enclosingFunctionFinder?: (n: SyntaxNode) => { funcName: string; label: NodeLabel } | null,
+  extractFunctionNameHook?: (n: SyntaxNode) => { funcName: string | null; label: NodeLabel } | null,
 ): string | undefined => {
   let current = node.parent;
   while (current) {
     if (FUNCTION_NODE_TYPES.has(current.type)) {
-      const { funcName } = extractFunctionName(current);
+      const funcName = extractFunctionNameHook?.(current)?.funcName ?? genericFuncName(current);
       if (funcName) return `${funcName}@${current.startIndex}`;
     }
     // Language-specific hook (e.g., Dart function_body → sibling function_signature)
@@ -389,7 +395,7 @@ const findEnclosingScopeKey = (
  * using cross-file type information when available.
  *
  * Only `.has()` is exposed — the SymbolTable doesn't support iteration.
- * Results are memoized to avoid redundant lookupFuzzy scans across declarations.
+ * Results are memoized to avoid redundant class-index scans across declarations.
  */
 const createClassNameLookup = (
   localNames: Set<string>,
@@ -404,7 +410,7 @@ const createClassNameLookup = (
       const cached = memo.get(name);
       if (cached !== undefined) return cached;
       const result = symbolTable
-        .lookupFuzzy(name)
+        .lookupClassByName(name)
         .some((def) => def.type === 'Class' || def.type === 'Enum' || def.type === 'Struct');
       memo.set(name, result);
       return result;
@@ -454,6 +460,13 @@ const SKIP_SUBTREE_TYPES = new Set([
 
 const CLASS_LIKE_TYPES = new Set(['Class', 'Struct', 'Interface']);
 
+const lookupClassDefsByName = (
+  symbolTable: SymbolTable,
+  name: string,
+  allowedTypes: ReadonlySet<string> = CLASS_LIKE_TYPES,
+): Array<{ nodeId: string; type: string }> =>
+  symbolTable.lookupClassByName(name).filter((d) => allowedTypes.has(d.type));
+
 /** Memoize class definition lookups during fixpoint iteration.
  *  SymbolTable is immutable during type resolution, so results never change.
  *  Eliminates redundant array allocations + filter scans across iterations. */
@@ -462,9 +475,7 @@ const createClassDefCache = (symbolTable?: SymbolTable) => {
   return (typeName: string) => {
     let result = cache.get(typeName);
     if (result === undefined) {
-      result = symbolTable
-        ? symbolTable.lookupFuzzy(typeName).filter((d) => CLASS_LIKE_TYPES.has(d.type))
-        : [];
+      result = symbolTable ? lookupClassDefsByName(symbolTable, typeName) : [];
       cache.set(typeName, result);
     }
     return result;
@@ -592,9 +603,7 @@ const resolveFieldType = (
   if (!symbolTable) return undefined;
   const receiverType = scopeEnv.get(receiver);
   if (!receiverType) return undefined;
-  const lookup =
-    getClassDefs ??
-    ((name: string) => symbolTable.lookupFuzzy(name).filter((d) => CLASS_LIKE_TYPES.has(d.type)));
+  const lookup = getClassDefs ?? ((name: string) => lookupClassDefsByName(symbolTable, name));
   const classDefs = lookup(receiverType);
   if (classDefs.length !== 1) return undefined;
   // Direct lookup first
@@ -621,11 +630,15 @@ const resolveMethodReturnType = (
   parentMap?: ReadonlyMap<string, readonly string[]>,
 ): string | undefined => {
   if (!symbolTable) return undefined;
-  const receiverType = scopeEnv.get(receiver);
+  let receiverType = scopeEnv.get(receiver);
+  // When substituteThisReceiver replaced $this/self with the enclosing class name,
+  // the receiver IS the type — look it up directly as a class name.
+  if (!receiverType) {
+    const lookup = getClassDefs ?? ((name: string) => lookupClassDefsByName(symbolTable, name));
+    if (lookup(receiver).length > 0) receiverType = receiver;
+  }
   if (!receiverType) return undefined;
-  const lookup =
-    getClassDefs ??
-    ((name: string) => symbolTable.lookupFuzzy(name).filter((d) => CLASS_LIKE_TYPES.has(d.type)));
+  const lookup = getClassDefs ?? ((name: string) => lookupClassDefsByName(symbolTable, name));
   const classDefs = lookup(receiverType);
   if (classDefs.length === 0) return undefined;
   // Direct lookup first
@@ -765,6 +778,11 @@ export interface BuildTypeEnvOptions {
   enclosingFunctionFinder?: (
     ancestorNode: SyntaxNode,
   ) => { funcName: string; label: NodeLabel } | null;
+  /** Language-specific function name extraction from an AST node.
+   *  Replaces the generic name-field lookup for languages with non-standard
+   *  AST structures (C/C++ declarator unwrapping, Swift init/deinit, etc.).
+   *  When null is returned or not provided, falls back to node.childForFieldName('name')?.text. */
+  extractFunctionName?: (node: SyntaxNode) => { funcName: string | null; label: NodeLabel } | null;
 }
 
 /** Seed cross-file type bindings into the file scope.
@@ -794,6 +812,7 @@ export const buildTypeEnv = (
 
   const symbolTable = options?.symbolTable;
   const parentMap = options?.parentMap;
+  const extractFuncNameHook = options?.extractFunctionName;
   const env: TypeEnv = new Map();
   const patternOverrides: PatternOverrides = new Map();
   // Phase P: maps `scope\0varName` → constructor type when a declaration has BOTH
@@ -955,47 +974,19 @@ export const buildTypeEnv = (
       // This decouples type node capture from scopeEnv success — container types
       // (User[], []User, List[User]) that fail extractSimpleTypeName still get
       // their AST type node recorded for Strategy 1 for-loop resolution.
-      // Try direct extraction first (works for Go var_spec, Python assignment, Rust let_declaration).
-      // Try direct type field first, then unwrap wrapper nodes (C# field_declaration,
-      // local_declaration_statement wrap their type inside a variable_declaration child).
-      let typeNode = node.childForFieldName('type');
+      //
+      // Prefer language-specific locator when provided (keeps buildTypeEnv generic),
+      // then fall back to a small set of safe, cross-grammar heuristics.
+      let typeNode =
+        config.getDeclarationTypeNode?.(node) ?? node.childForFieldName('type') ?? null;
+      // Fallback: some grammars wrap type annotations in a `type_annotation` child
+      // instead of exposing a named `type` field on the declaration node.
       if (!typeNode) {
-        // C# field_declaration / local_declaration_statement wrap type inside variable_declaration.
-        // Use manual loop instead of namedChildren.find() to avoid array allocation on hot path.
-        let wrapped = node.childForFieldName('declaration');
-        if (!wrapped) {
-          for (let i = 0; i < node.namedChildCount; i++) {
-            const c = node.namedChild(i);
-            if (c?.type === 'variable_declaration') {
-              wrapped = c;
-              break;
-            }
-          }
-        }
-        if (wrapped) {
-          typeNode = wrapped.childForFieldName('type');
-          // Kotlin: variable_declaration stores the type as user_type / nullable_type
-          // child rather than a named 'type' field.
-          if (!typeNode) {
-            for (let i = 0; i < wrapped.namedChildCount; i++) {
-              const c = wrapped.namedChild(i);
-              if (c && (c.type === 'user_type' || c.type === 'nullable_type')) {
-                typeNode = c;
-                break;
-              }
-            }
-          }
-        }
-        // Swift: property_declaration has type_annotation as a direct child (not a 'type' field).
-        // Extract the inner type node (array_type, user_type, etc.) for declarationTypeNodes.
-        if (!typeNode) {
-          for (let i = 0; i < node.namedChildCount; i++) {
-            const c = node.namedChild(i);
-            if (c?.type === 'type_annotation') {
-              // Use the inner type (array_type, user_type) rather than the annotation wrapper
-              typeNode = c.firstNamedChild ?? c;
-              break;
-            }
+        for (let i = 0; i < node.namedChildCount; i++) {
+          const c = node.namedChild(i);
+          if (c?.type === 'type_annotation') {
+            typeNode = c.firstNamedChild ?? c;
+            break;
           }
         }
       }
@@ -1085,7 +1076,7 @@ export const buildTypeEnv = (
     // Detect scope boundaries (function/method definitions)
     let scope = currentScope;
     if (FUNCTION_NODE_TYPES.has(node.type)) {
-      const { funcName } = extractFunctionName(node);
+      const funcName = extractFuncNameHook?.(node)?.funcName ?? genericFuncName(node);
       if (funcName) scope = `${funcName}@${node.startIndex}`;
     }
 
@@ -1234,7 +1225,14 @@ export const buildTypeEnv = (
 
   return {
     lookup: (varName, callNode) =>
-      lookupInEnv(env, varName, callNode, patternOverrides, options?.enclosingFunctionFinder),
+      lookupInEnv(
+        env,
+        varName,
+        callNode,
+        patternOverrides,
+        options?.enclosingFunctionFinder,
+        extractFuncNameHook,
+      ),
     constructorBindings: bindings,
     fileScope: () => env.get(FILE_SCOPE) ?? EMPTY_FILE_SCOPE,
     allScopes: () => env as ReadonlyMap<string, ReadonlyMap<string, string>>,

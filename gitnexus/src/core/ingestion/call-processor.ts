@@ -7,14 +7,18 @@ import { TIER_CONFIDENCE, type ResolutionTier } from './resolution-context.js';
 import { isLanguageAvailable, loadParser, loadLanguage } from '../tree-sitter/parser-loader.js';
 import { getProvider } from './languages/index.js';
 import { generateId } from '../../lib/utils.js';
-import { getLanguageFromFilename } from 'gitnexus-shared';
+import { getLanguageFromFilename, SupportedLanguages } from 'gitnexus-shared';
 import { isVerboseIngestionEnabled } from './utils/verbose.js';
 import { yieldToEventLoop } from './utils/event-loop.js';
 import {
   FUNCTION_NODE_TYPES,
-  extractFunctionName,
   findEnclosingClassId,
+  findEnclosingClassInfo,
+  genericFuncName,
+  inferFunctionLabel,
 } from './utils/ast-helpers.js';
+import { typeTagForId, constTagForId, buildCollisionGroups } from './utils/method-props.js';
+import type { MethodInfo } from './method-types.js';
 import {
   countCallArguments,
   inferCallForm,
@@ -37,13 +41,18 @@ import type {
   FileConstructorBindings,
 } from './workers/parse-worker.js';
 import { normalizeFetchURL, routeMatches } from './route-extractors/nextjs.js';
+import { extractTemplateComponents } from './vue-sfc-extractor.js';
 import { extractReturnTypeName, stripNullable } from './type-extractors/shared.js';
 import type { LiteralTypeInferrer } from './type-extractors/types.js';
 import type { SyntaxNode } from './utils/ast-helpers.js';
+import { extractParsedCallSite } from './call-sites/extract-language-call-site.js';
 
 /** Per-file resolved type bindings for exported symbols.
  *  Populated during call processing, consumed by Phase 14 re-resolution pass. */
 export type ExportedTypeMap = Map<string, Map<string, string>>;
+
+/** Types that represent class-like declarations (used for receiver/owner resolution). */
+const CLASS_LIKE_TYPES = new Set(['Class', 'Struct', 'Interface', 'Enum', 'Record', 'Impl']);
 
 const MAX_EXPORTS_PER_FILE = 500;
 const MAX_TYPE_NAME_LENGTH = 256;
@@ -138,8 +147,10 @@ export function buildExportedTypeMapFromGraph(
     const filePath = node.properties.filePath as string;
     const name = node.properties.name as string;
     if (!name || name.length > MAX_TYPE_NAME_LENGTH) return;
-    // For callable symbols, use returnType; for properties/variables, use declaredType
-    const def = symbolTable.lookupExactFull(filePath, name);
+    // For callable symbols, use returnType; for properties/variables, use declaredType.
+    // Use lookupExactAll + nodeId match to handle same-name methods in different classes.
+    const defs = symbolTable.lookupExactAll(filePath, name);
+    const def = defs.find((d) => d.nodeId === node.id) ?? defs[0];
     if (!def) return;
     const typeName = def.returnType ?? def.declaredType;
     if (!typeName || typeName.length > MAX_TYPE_NAME_LENGTH) return;
@@ -215,6 +226,14 @@ const TYPE_PRESERVING_METHODS = new Set([
   'orElseThrow', // Java Optional
 ]);
 
+/** Cache for method extraction results in findEnclosingFunction fallback path.
+ *  Keyed by classNode.id to avoid re-extracting the same class body per call site.
+ *  Cleared between files at line ~611 in the processCalls file loop. */
+const enclosingFnExtractCache = new Map<
+  number,
+  import('./method-types.js').ExtractedMethods | null
+>();
+
 /**
  * Walk up the AST from a node to find the enclosing function/method.
  * Returns null if the call is at module/file level (top-level code).
@@ -229,21 +248,99 @@ const findEnclosingFunction = (
 
   while (current) {
     if (FUNCTION_NODE_TYPES.has(current.type)) {
-      const { funcName, label } = extractFunctionName(current);
+      const efnResult = provider.methodExtractor?.extractFunctionName?.(current);
+      const funcName = efnResult?.funcName ?? genericFuncName(current);
+      const label = efnResult?.label ?? inferFunctionLabel(current.type);
 
       if (funcName) {
         const resolved = ctx.resolve(funcName, filePath);
         if (resolved?.tier === 'same-file' && resolved.candidates.length > 0) {
-          return resolved.candidates[0].nodeId;
+          // Disambiguate by enclosing class when multiple candidates
+          if (resolved.candidates.length === 1) {
+            return resolved.candidates[0].nodeId;
+          }
+          const classInfo = findEnclosingClassInfo(current, filePath);
+          if (classInfo) {
+            const classMatches = resolved.candidates.filter((c) => c.ownerId === classInfo.classId);
+            // Unique class match — return it (no same-arity ambiguity)
+            if (classMatches.length === 1) return classMatches[0].nodeId;
+            // Multiple same-class candidates (same-arity overloads) — fall through
+            // to the fallback path which computes the exact ID with type-hash.
+            if (classMatches.length > 1) {
+              /* fall through to manual ID construction below */
+            } else {
+              // No class match — return first candidate as before
+              return resolved.candidates[0].nodeId;
+            }
+          } else {
+            return resolved.candidates[0].nodeId;
+          }
         }
 
-        // Apply labelOverride so label matches the definition phase (single source of truth).
+        // Fallback: qualify the generated ID to match definition-phase node IDs
         let finalLabel = label;
         if (provider.labelOverride) {
           const override = provider.labelOverride(current, label);
           if (override !== null) finalLabel = override;
         }
-        return generateId(finalLabel, `${filePath}:${funcName}`);
+        const classInfo2 = findEnclosingClassInfo(current, filePath);
+        const qualifiedName = classInfo2 ? `${classInfo2.className}.${funcName}` : funcName;
+        // Include #<arity> and ~typeTag suffix to match definition-phase Method/Constructor IDs.
+        const language = getLanguageFromFilename(filePath);
+        let arity: number | undefined;
+        let encTypeTag = '';
+        if (
+          (finalLabel === 'Method' || finalLabel === 'Constructor') &&
+          provider.methodExtractor &&
+          language
+        ) {
+          // Get class method map (cached per classNode.id) and look up current method
+          // by funcName:line. This avoids per-call-site extractFromNode AST walks.
+          let classNode = current.parent;
+          while (classNode && !provider.methodExtractor.isTypeDeclaration(classNode)) {
+            classNode = classNode.parent;
+          }
+          let info: MethodInfo | undefined;
+          if (classNode) {
+            let extracted = enclosingFnExtractCache.get(classNode.id);
+            if (extracted === undefined) {
+              extracted =
+                provider.methodExtractor.extract(classNode, { filePath, language }) ?? null;
+              enclosingFnExtractCache.set(classNode.id, extracted);
+            }
+            if (extracted?.methods?.length) {
+              const defLine = current.startPosition.row + 1;
+              info = extracted.methods.find((m) => m.name === funcName && m.line === defLine);
+              if (info) {
+                arity = info.parameters.some((p) => p.isVariadic)
+                  ? undefined
+                  : info.parameters.length;
+              }
+              if (arity !== undefined && info) {
+                const methodMap = new Map<string, MethodInfo>();
+                for (const m of extracted.methods) methodMap.set(`${m.name}:${m.line}`, m);
+                const groups = buildCollisionGroups(methodMap);
+                encTypeTag =
+                  typeTagForId(methodMap, funcName, arity, info, language, groups) +
+                  constTagForId(methodMap, funcName, arity, info, groups);
+              }
+            }
+          }
+          // Fallback: extractFromNode for top-level methods without a class
+          if (!info && provider.methodExtractor.extractFromNode) {
+            const nodeInfo = provider.methodExtractor.extractFromNode(current, {
+              filePath,
+              language,
+            });
+            if (nodeInfo) {
+              arity = nodeInfo.parameters.some((p) => p.isVariadic)
+                ? undefined
+                : nodeInfo.parameters.length;
+            }
+          }
+        }
+        const arityTag = arity !== undefined ? `#${arity}${encTypeTag}` : '';
+        return generateId(finalLabel, `${filePath}:${qualifiedName}${arityTag}`);
       }
     }
 
@@ -252,17 +349,96 @@ const findEnclosingFunction = (
     if (provider.enclosingFunctionFinder) {
       const customResult = provider.enclosingFunctionFinder(current);
       if (customResult) {
-        // Try SymbolTable first (same pattern as the FUNCTION_NODE_TYPES branch above).
         const resolved = ctx.resolve(customResult.funcName, filePath);
         if (resolved?.tier === 'same-file' && resolved.candidates.length > 0) {
-          return resolved.candidates[0].nodeId;
+          if (resolved.candidates.length === 1) {
+            return resolved.candidates[0].nodeId;
+          }
+          const classInfo = findEnclosingClassInfo(current.previousSibling ?? current, filePath);
+          if (classInfo) {
+            const classMatches = resolved.candidates.filter((c) => c.ownerId === classInfo.classId);
+            if (classMatches.length === 1) return classMatches[0].nodeId;
+            if (classMatches.length > 1) {
+              /* fall through to manual ID construction below */
+            } else {
+              return resolved.candidates[0].nodeId;
+            }
+          } else {
+            return resolved.candidates[0].nodeId;
+          }
         }
         let finalLabel = customResult.label;
         if (provider.labelOverride) {
           const override = provider.labelOverride(current.previousSibling!, finalLabel);
           if (override !== null) finalLabel = override;
         }
-        return generateId(finalLabel, `${filePath}:${customResult.funcName}`);
+        const classInfo2 = findEnclosingClassInfo(current.previousSibling ?? current, filePath);
+        const qualifiedName = classInfo2
+          ? `${classInfo2.className}.${customResult.funcName}`
+          : customResult.funcName;
+        // Include #<arity> and ~typeTag suffix to match definition-phase Method/Constructor IDs.
+        const sigNode = current.previousSibling ?? current;
+        const language2 = getLanguageFromFilename(filePath);
+        let arity2: number | undefined;
+        let encTypeTag2 = '';
+        if (
+          (finalLabel === 'Method' || finalLabel === 'Constructor') &&
+          provider.methodExtractor &&
+          language2
+        ) {
+          let classNode2 = (current.previousSibling ?? current).parent;
+          while (classNode2 && !provider.methodExtractor.isTypeDeclaration(classNode2)) {
+            classNode2 = classNode2.parent;
+          }
+          let info2: MethodInfo | undefined;
+          if (classNode2) {
+            let extracted2 = enclosingFnExtractCache.get(classNode2.id);
+            if (extracted2 === undefined) {
+              extracted2 =
+                provider.methodExtractor.extract(classNode2, { filePath, language: language2 }) ??
+                null;
+              enclosingFnExtractCache.set(classNode2.id, extracted2);
+            }
+            if (extracted2?.methods?.length) {
+              const defLine2 = sigNode.startPosition.row + 1;
+              info2 = extracted2.methods.find(
+                (m) => m.name === customResult.funcName && m.line === defLine2,
+              );
+              if (info2) {
+                arity2 = info2.parameters.some((p) => p.isVariadic)
+                  ? undefined
+                  : info2.parameters.length;
+              }
+              if (arity2 !== undefined && info2) {
+                const methodMap = new Map<string, MethodInfo>();
+                for (const m of extracted2.methods) methodMap.set(`${m.name}:${m.line}`, m);
+                const groups2 = buildCollisionGroups(methodMap);
+                encTypeTag2 =
+                  typeTagForId(
+                    methodMap,
+                    customResult.funcName,
+                    arity2,
+                    info2,
+                    language2,
+                    groups2,
+                  ) + constTagForId(methodMap, customResult.funcName, arity2, info2, groups2);
+              }
+            }
+          }
+          if (!info2 && provider.methodExtractor.extractFromNode) {
+            const nodeInfo = provider.methodExtractor.extractFromNode(sigNode, {
+              filePath,
+              language: language2,
+            });
+            if (nodeInfo) {
+              arity2 = nodeInfo.parameters.some((p) => p.isVariadic)
+                ? undefined
+                : nodeInfo.parameters.length;
+            }
+          }
+        }
+        const arityTag2 = arity2 !== undefined ? `#${arity2}${encTypeTag2}` : '';
+        return generateId(finalLabel, `${filePath}:${qualifiedName}${arityTag2}`);
       }
     }
 
@@ -469,6 +645,7 @@ export const processCalls = async (
 
   for (let i = 0; i < files.length; i++) {
     const file = files[i];
+    enclosingFnExtractCache.clear();
     onProgress?.(i + 1, files.length);
     if (i % 20 === 0) await yieldToEventLoop();
 
@@ -563,6 +740,7 @@ export const processCalls = async (
       importedReturnTypes,
       importedRawReturnTypes,
       enclosingFunctionFinder: provider?.enclosingFunctionFinder,
+      extractFunctionName: provider?.methodExtractor?.extractFunctionName,
     });
     if (typeEnv && exportedTypeMap) {
       const fileExports = collectExportedBindings(typeEnv, file.path, ctx.symbols, graph);
@@ -609,17 +787,7 @@ export const processCalls = async (
         }
         if (!receiverTypeName && receiverText) {
           const resolved = ctx.resolve(receiverText, file.path);
-          if (
-            resolved?.candidates.some(
-              (d) =>
-                d.type === 'Class' ||
-                d.type === 'Struct' ||
-                d.type === 'Interface' ||
-                d.type === 'Enum' ||
-                d.type === 'Record' ||
-                d.type === 'Impl',
-            )
-          ) {
+          if (resolved?.candidates.some((d) => CLASS_LIKE_TYPES.has(d.type))) {
             receiverTypeName = receiverText;
           }
         }
@@ -642,6 +810,75 @@ export const processCalls = async (
       }
 
       if (!captureMap['call']) return;
+
+      const callNode = captureMap['call'];
+      const languageSeed = extractParsedCallSite(language, callNode);
+      if (languageSeed) {
+        if (provider.isBuiltInName(languageSeed.calledName)) return;
+
+        const sourceId =
+          findEnclosingFunction(callNode, file.path, ctx, provider) ||
+          generateId('File', file.path);
+        const receiverName =
+          languageSeed.callForm === 'member' ? languageSeed.receiverName : undefined;
+        let receiverTypeName =
+          receiverName && typeEnv ? typeEnv.lookup(receiverName, callNode) : undefined;
+
+        if (
+          receiverName !== undefined &&
+          receiverTypeName === undefined &&
+          languageSeed.callForm === 'member' &&
+          (language === 'java' || language === 'csharp' || language === 'kotlin')
+        ) {
+          const c0 = receiverName.charCodeAt(0);
+          if (c0 >= 65 && c0 <= 90) receiverTypeName = receiverName;
+        }
+
+        const resolved = resolveCallTarget(
+          {
+            calledName: languageSeed.calledName,
+            callForm: languageSeed.callForm,
+            ...(receiverTypeName !== undefined ? { receiverTypeName } : {}),
+            ...(receiverName !== undefined ? { receiverName } : {}),
+          },
+          file.path,
+          ctx,
+          undefined,
+          widenCache,
+        );
+
+        if (!resolved) return;
+        graph.addRelationship({
+          id: generateId('CALLS', `${sourceId}:${languageSeed.calledName}->${resolved.nodeId}`),
+          sourceId,
+          targetId: resolved.nodeId,
+          type: 'CALLS',
+          confidence: resolved.confidence,
+          reason: resolved.reason,
+        });
+
+        if (implementorMap && languageSeed.callForm === 'member' && receiverTypeName) {
+          const implTargets = findInterfaceDispatchTargets(
+            languageSeed.calledName,
+            receiverTypeName,
+            file.path,
+            ctx,
+            implementorMap,
+            resolved.nodeId,
+          );
+          for (const impl of implTargets) {
+            graph.addRelationship({
+              id: generateId('CALLS', `${sourceId}:${languageSeed.calledName}->${impl.nodeId}`),
+              sourceId,
+              targetId: impl.nodeId,
+              type: 'CALLS',
+              confidence: impl.confidence,
+              reason: impl.reason,
+            });
+          }
+        }
+        return;
+      }
 
       const nameNode = captureMap['call.name'];
       if (!nameNode) return;
@@ -718,7 +955,6 @@ export const processCalls = async (
 
       if (provider.isBuiltInName(calledName)) return;
 
-      const callNode = captureMap['call'];
       const callForm = inferCallForm(callNode, nameNode);
       const receiverName = callForm === 'member' ? extractReceiverName(nameNode) : undefined;
       let receiverTypeName =
@@ -735,7 +971,8 @@ export const processCalls = async (
         let p = callNode.parent;
         while (p) {
           if (FUNCTION_NODE_TYPES.has(p.type)) {
-            const { funcName } = extractFunctionName(p);
+            const funcName =
+              provider.methodExtractor?.extractFunctionName?.(p)?.funcName ?? genericFuncName(p);
             if (funcName) {
               scope = `${funcName}@${p.startIndex}`;
               break;
@@ -756,12 +993,8 @@ export const processCalls = async (
           if (
             isSubclassOf(ctorType, receiverTypeName, parentMap) ||
             isSubclassOf(ctorType, receiverTypeName, globalParentMap) ||
-            (ctx.symbols
-              .lookupFuzzy(ctorType)
-              .some((d) => d.type === 'Class' || d.type === 'Struct') &&
-              ctx.symbols
-                .lookupFuzzy(receiverTypeName)
-                .some((d) => d.type === 'Class' || d.type === 'Struct' || d.type === 'Interface'))
+            (ctx.symbols.lookupClassByName(ctorType).length > 0 &&
+              ctx.symbols.lookupClassByName(receiverTypeName).length > 0)
           ) {
             receiverTypeName = ctorType;
           }
@@ -892,6 +1125,41 @@ export const processCalls = async (
         }
       }
     });
+
+    // Vue: emit CALLS edges for PascalCase components used in <template>.
+    // Template components are default-imported (not named), so we match the
+    // component name against imported .vue file basenames via the import map.
+    if (language === SupportedLanguages.Vue) {
+      const templateComponents = extractTemplateComponents(file.content);
+      if (templateComponents.length > 0) {
+        const fileId = generateId('File', file.path);
+        const importedFiles = ctx.importMap.get(file.path);
+        if (importedFiles) {
+          for (const componentName of templateComponents) {
+            for (const importedPath of importedFiles) {
+              if (!importedPath.endsWith('.vue')) continue;
+              const basename = importedPath.slice(
+                importedPath.lastIndexOf('/') + 1,
+                importedPath.lastIndexOf('.'),
+              );
+              if (basename !== componentName) continue;
+              const targetFileId = generateId('File', importedPath);
+              if (graph.getNode(targetFileId)) {
+                graph.addRelationship({
+                  id: generateId('CALLS', `${fileId}:${componentName}->${targetFileId}`),
+                  sourceId: fileId,
+                  targetId: targetFileId,
+                  type: 'CALLS',
+                  confidence: 0.9,
+                  reason: 'vue-template-component',
+                });
+              }
+              break;
+            }
+          }
+        }
+      }
+    }
 
     ctx.clearCache();
   }
@@ -1242,10 +1510,18 @@ const resolveCallTarget = (
 /** Extract the function name from a scope key ("funcName@startIndex" → "funcName"). */
 const extractFuncNameFromScope = (scope: string): string => scope.slice(0, scope.indexOf('@'));
 
-/** Extract the trailing function name from a sourceId ("Function:filepath:funcName" → "funcName"). */
+/** Extract the bare function name from a sourceId.
+ *  Handles both unqualified ("Function:filepath:funcName" → "funcName")
+ *  and qualified ("Function:filepath:ClassName.funcName" → "funcName").
+ *  Strips any trailing #<arity> suffix from Method/Constructor IDs. */
 const extractFuncNameFromSourceId = (sourceId: string): string => {
   const lastColon = sourceId.lastIndexOf(':');
-  return lastColon >= 0 ? sourceId.slice(lastColon + 1) : '';
+  const segment = lastColon >= 0 ? sourceId.slice(lastColon + 1) : '';
+  const dotIdx = segment.lastIndexOf('.');
+  const raw = dotIdx >= 0 ? segment.slice(dotIdx + 1) : segment;
+  // Strip #<arity> suffix (e.g. "save#2" → "save")
+  const hashIdx = raw.indexOf('#');
+  return hashIdx >= 0 ? raw.slice(0, hashIdx) : raw;
 };
 
 /**
@@ -1269,6 +1545,12 @@ type ReceiverTypeIndex = Map<string, Map<string, ReceiverTypeEntry>>;
  * The verified map is keyed by `scope\0varName` where scope is either
  * "funcName@startIndex" (inside a function) or "" (file level).
  * Index structure: Map<funcName, Map<varName, ReceiverTypeEntry>>
+ *
+ * Known limitation: the index collapses scope keys to bare funcName,
+ * so two same-arity overloads with the same local variable name but
+ * different types will mark that variable as ambiguous. A future
+ * enhancement should key by full scope (funcName@startIndex) and carry
+ * scope keys through findEnclosingFunction's return type.
  */
 const buildReceiverTypeIndex = (map: Map<string, string>): ReceiverTypeIndex => {
   const index: ReceiverTypeIndex = new Map();
@@ -1363,18 +1645,29 @@ const resolveFieldOwnership = (
 ): { nodeId: string; declaredType?: string } | undefined => {
   const typeResolved = ctx.resolve(receiverName, filePath);
   if (!typeResolved) return undefined;
-  const classDef = typeResolved.candidates.find(
-    (d) =>
-      d.type === 'Class' ||
-      d.type === 'Struct' ||
-      d.type === 'Interface' ||
-      d.type === 'Enum' ||
-      d.type === 'Record' ||
-      d.type === 'Impl',
-  );
+  const classDef = typeResolved.candidates.find((d) => CLASS_LIKE_TYPES.has(d.type));
   if (!classDef) return undefined;
 
   return ctx.symbols.lookupFieldByOwner(classDef.nodeId, fieldName) ?? undefined;
+};
+
+/**
+ * Resolve a method by owner type name using the eagerly-populated methodByOwner index.
+ * Returns the SymbolDefinition if an unambiguous method is found, undefined otherwise.
+ * Falls through to undefined for: unknown type, no class-like candidates, ambiguous overloads.
+ */
+const resolveMethodByOwner = (
+  receiverTypeName: string,
+  methodName: string,
+  filePath: string,
+  ctx: ResolutionContext,
+): SymbolDefinition | undefined => {
+  const typeResolved = ctx.resolve(receiverTypeName, filePath);
+  if (!typeResolved) return undefined;
+  const classDef = typeResolved.candidates.find((d) => CLASS_LIKE_TYPES.has(d.type));
+  if (!classDef) return undefined;
+
+  return ctx.symbols.lookupMethodByOwner(classDef.nodeId, methodName);
 };
 
 /**
@@ -1437,6 +1730,19 @@ const walkMixedChain = (
         currentType = fieldResolved.typeName;
         continue;
       }
+      // Fast path: O(1) owner-scoped method lookup via methodByOwner index.
+      // Avoids fuzzy lookup when the owner type is known and the method is unambiguous.
+      // Note: CALLS edges for intermediate chain steps are NOT emitted here — walkMixedChain
+      // only threads types. CALLS edges come from the outer per-call-expression loop in processCalls.
+      const methodDef = resolveMethodByOwner(currentType, step.name, filePath, ctx);
+      if (methodDef?.returnType) {
+        const fastRetType = extractReturnTypeName(methodDef.returnType);
+        if (fastRetType) {
+          currentType = fastRetType;
+          continue;
+        }
+      }
+      // Fallback: fuzzy resolution via resolveCallTarget (cross-file, inherited, etc.)
       const resolved = resolveCallTarget(
         { calledName: step.name, callForm: 'member', receiverTypeName: currentType },
         filePath,
@@ -1590,7 +1896,38 @@ export const processCallsFromExtracted = async (
         widenCache,
         effectiveCall.argTypes,
       );
-      if (!resolved) continue;
+      if (!resolved) {
+        // Vue template component fallback: match calledName against imported .vue basenames
+        if (effectiveCall.filePath.endsWith('.vue') && effectiveCall.sourceId.startsWith('File:')) {
+          const importedFiles = ctx.importMap.get(effectiveCall.filePath);
+          if (importedFiles) {
+            for (const importedPath of importedFiles) {
+              if (!importedPath.endsWith('.vue')) continue;
+              const basename = importedPath.slice(
+                importedPath.lastIndexOf('/') + 1,
+                importedPath.lastIndexOf('.'),
+              );
+              if (basename !== effectiveCall.calledName) continue;
+              const targetFileId = generateId('File', importedPath);
+              if (graph.getNode(targetFileId)) {
+                graph.addRelationship({
+                  id: generateId(
+                    'CALLS',
+                    `${effectiveCall.sourceId}:${effectiveCall.calledName}->${targetFileId}`,
+                  ),
+                  sourceId: effectiveCall.sourceId,
+                  targetId: targetFileId,
+                  type: 'CALLS',
+                  confidence: 0.9,
+                  reason: 'vue-template-component',
+                });
+              }
+              break;
+            }
+          }
+        }
+        continue;
+      }
 
       const relId = generateId(
         'CALLS',
@@ -1672,17 +2009,7 @@ export const processAssignmentsFromExtracted = (
     // Tier 3: static class-as-receiver fallback
     if (!receiverTypeName) {
       const resolved = ctx.resolve(asn.receiverText, asn.filePath);
-      if (
-        resolved?.candidates.some(
-          (d) =>
-            d.type === 'Class' ||
-            d.type === 'Struct' ||
-            d.type === 'Interface' ||
-            d.type === 'Enum' ||
-            d.type === 'Record' ||
-            d.type === 'Impl',
-        )
-      ) {
+      if (resolved?.candidates.some((d) => CLASS_LIKE_TYPES.has(d.type))) {
         receiverTypeName = asn.receiverText;
       }
     }

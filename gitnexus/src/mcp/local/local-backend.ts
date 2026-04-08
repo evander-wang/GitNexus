@@ -15,7 +15,7 @@ import {
   closeLbug,
   isLbugReady,
   isWriteQuery,
-} from '../core/lbug-adapter.js';
+} from '../../core/lbug/pool-adapter.js';
 export { isWriteQuery };
 // Embedding imports are lazy (dynamic import) to avoid loading onnxruntime-node
 // at MCP server startup — crashes on unsupported Node ABI versions (#89)
@@ -26,6 +26,7 @@ import {
   cleanupOldKuzuFiles,
   type RegistryEntry,
 } from '../../storage/repo-manager.js';
+import { GroupService, type GroupToolPort } from '../../core/group/service.js';
 // AI context generation is CLI-only (gitnexus analyze)
 // import { generateAIContextFiles } from '../../cli/ai-context.js';
 
@@ -95,7 +96,9 @@ export const VALID_RELATION_TYPES = new Set([
   'IMPLEMENTS',
   'HAS_METHOD',
   'HAS_PROPERTY',
-  'OVERRIDES',
+  'METHOD_OVERRIDES',
+  'OVERRIDES', // Legacy alias — dual-read for pre-rename indexes
+  'METHOD_IMPLEMENTS',
   'ACCESSES',
   'HANDLES_ROUTE',
   'FETCHES',
@@ -116,7 +119,8 @@ export const VALID_RELATION_TYPES = new Set([
  *   CALLS / IMPORTS  – direct, strongly-typed references → 0.9
  *   EXTENDS          – class hierarchy, statically verifiable → 0.85
  *   IMPLEMENTS       – interface contract, statically verifiable → 0.85
- *   OVERRIDES        – method override, statically verifiable → 0.85
+ *   METHOD_OVERRIDES  – method override, statically verifiable → 0.85
+ *   METHOD_IMPLEMENTS – interface method implementation, statically verifiable → 0.85
  *   HAS_METHOD       – structural containment → 0.95
  *   HAS_PROPERTY     – structural containment → 0.95
  *   ACCESSES         – field read/write, may be indirect → 0.8
@@ -128,7 +132,8 @@ export const IMPACT_RELATION_CONFIDENCE: Readonly<Record<string, number>> = {
   IMPORTS: 0.9,
   EXTENDS: 0.85,
   IMPLEMENTS: 0.85,
-  OVERRIDES: 0.85,
+  METHOD_OVERRIDES: 0.85,
+  METHOD_IMPLEMENTS: 0.85,
   HAS_METHOD: 0.95,
   HAS_PROPERTY: 0.95,
   ACCESSES: 0.8,
@@ -175,6 +180,28 @@ export class LocalBackend {
   private initializedRepos: Set<string> = new Set();
   private reinitPromises: Map<string, Promise<void>> = new Map();
   private lastStalenessCheck: Map<string, number> = new Map();
+  private groupToolSvc: GroupService | null = null;
+
+  /**
+   * Cross-repo group tools (CLI). Shares logic with MCP `group_*` handlers.
+   */
+  getGroupService(): GroupService {
+    if (!this.groupToolSvc) {
+      const port: GroupToolPort = {
+        resolveRepo: (p) => this.resolveRepo(p),
+        impact: (r, p) => this.impact(r as RepoHandle, p),
+        query: (r, p) => this.query(r as RepoHandle, p),
+        impactByUid: (id, uid, d, o) => this.impactByUid(id, uid, d, o),
+      };
+      this.groupToolSvc = new GroupService(port);
+    }
+    return this.groupToolSvc;
+  }
+
+  /** Close all pooled LadybugDB connections (CLI one-shot; optional for long-lived MCP). */
+  async dispose(): Promise<void> {
+    await closeLbug();
+  }
 
   // ─── Initialization ──────────────────────────────────────────────
 
@@ -428,6 +455,10 @@ export class LocalBackend {
   async callTool(method: string, params: any): Promise<any> {
     if (method === 'list_repos') {
       return this.listRepos();
+    }
+
+    if (method.startsWith('group_')) {
+      return this.handleGroupTool(method, params || {});
     }
 
     // Resolve repo from optional param (re-reads registry on miss)
@@ -1188,7 +1219,7 @@ export class LocalBackend {
       repo.id,
       `
       MATCH (caller)-[r:CodeRelation]->(n {id: $symId})
-      WHERE r.type IN ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS', 'HAS_METHOD', 'HAS_PROPERTY', 'OVERRIDES', 'ACCESSES']
+      WHERE r.type IN ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS', 'HAS_METHOD', 'HAS_PROPERTY', 'METHOD_OVERRIDES', 'OVERRIDES', 'METHOD_IMPLEMENTS', 'ACCESSES']
       RETURN r.type AS relType, caller.id AS uid, caller.name AS name, caller.filePath AS filePath, labels(caller)[0] AS kind
       LIMIT 30
     `,
@@ -1278,7 +1309,7 @@ export class LocalBackend {
       repo.id,
       `
       MATCH (n {id: $symId})-[r:CodeRelation]->(target)
-      WHERE r.type IN ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS', 'HAS_METHOD', 'HAS_PROPERTY', 'OVERRIDES', 'ACCESSES']
+      WHERE r.type IN ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS', 'HAS_METHOD', 'HAS_PROPERTY', 'METHOD_OVERRIDES', 'OVERRIDES', 'METHOD_IMPLEMENTS', 'ACCESSES']
       RETURN r.type AS relType, target.id AS uid, target.name AS name, target.filePath AS filePath, labels(target)[0] AS kind
       LIMIT 30
     `,
@@ -1317,16 +1348,53 @@ export class LocalBackend {
       return cats;
     };
 
+    // Method/Function/Constructor enrichment: fetch method-specific properties
+    const symKind = isClassLike ? resolvedLabel || 'Class' : sym.type || sym[2];
+    const isMethodLike =
+      symKind === 'Method' || symKind === 'Function' || symKind === 'Constructor';
+    let methodMetadata: Record<string, unknown> | undefined;
+    if (isMethodLike) {
+      try {
+        const metaRows = await executeParameterized(
+          repo.id,
+          `
+          MATCH (n {id: $symId})
+          RETURN n.visibility AS visibility, n.isStatic AS isStatic, n.isAbstract AS isAbstract,
+                 n.isFinal AS isFinal, n.isVirtual AS isVirtual, n.isOverride AS isOverride,
+                 n.isAsync AS isAsync, n.isPartial AS isPartial, n.returnType AS returnType,
+                 n.parameterCount AS parameterCount, n.isVariadic AS isVariadic,
+                 n.requiredParameterCount AS requiredParameterCount,
+                 n.parameterTypes AS parameterTypes, n.annotations AS annotations
+          LIMIT 1
+        `,
+          { symId },
+        );
+        if (metaRows.length > 0) {
+          const row = metaRows[0];
+          const meta: Record<string, unknown> = {};
+          // Only include defined properties to distinguish "not applicable" from "not enriched"
+          for (const key of Object.keys(row)) {
+            const val = row[key];
+            if (val !== null && val !== undefined) meta[key] = val;
+          }
+          if (Object.keys(meta).length > 0) methodMetadata = meta;
+        }
+      } catch {
+        /* method metadata unavailable — omit silently */
+      }
+    }
+
     return {
       status: 'found',
       symbol: {
         uid: sym.id || sym[0],
         name: sym.name || sym[1],
-        kind: isClassLike ? resolvedLabel || 'Class' : sym.type || sym[2],
+        kind: symKind,
         filePath: sym.filePath || sym[3],
         startLine: sym.startLine || sym[4],
         endLine: sym.endLine || sym[5],
         ...(include_content && (sym.content || sym[6]) ? { content: sym.content || sym[6] } : {}),
+        ...(methodMetadata ? { methodMetadata } : {}),
       },
       incoming: categorize(incomingRows),
       outgoing: categorize(outgoingRows),
@@ -1860,17 +1928,36 @@ export class LocalBackend {
 
     const { target, direction } = params;
     const maxDepth = params.maxDepth || 3;
+    // Map legacy relation type names before filtering (backward compat for OVERRIDES → METHOD_OVERRIDES)
+    const mappedRelTypes = params.relationTypes?.flatMap((t: string) =>
+      t === 'OVERRIDES' ? ['OVERRIDES', 'METHOD_OVERRIDES'] : [t],
+    );
     const rawRelTypes =
-      params.relationTypes && params.relationTypes.length > 0
-        ? params.relationTypes.filter((t) => VALID_RELATION_TYPES.has(t))
-        : ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS'];
+      mappedRelTypes && mappedRelTypes.length > 0
+        ? mappedRelTypes.filter((t: string) => VALID_RELATION_TYPES.has(t))
+        : [
+            'CALLS',
+            'IMPORTS',
+            'EXTENDS',
+            'IMPLEMENTS',
+            'METHOD_OVERRIDES',
+            'OVERRIDES',
+            'METHOD_IMPLEMENTS',
+          ];
     const relationTypes =
-      rawRelTypes.length > 0 ? rawRelTypes : ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS'];
+      rawRelTypes.length > 0
+        ? rawRelTypes
+        : [
+            'CALLS',
+            'IMPORTS',
+            'EXTENDS',
+            'IMPLEMENTS',
+            'METHOD_OVERRIDES',
+            'OVERRIDES',
+            'METHOD_IMPLEMENTS',
+          ];
     const includeTests = params.includeTests ?? false;
     const minConfidence = params.minConfidence ?? 0;
-
-    const relTypeFilter = relationTypes.map((t) => `'${t}'`).join(', ');
-    const confidenceFilter = minConfidence > 0 ? ` AND r.confidence >= ${minConfidence}` : '';
 
     // Resolve target by name, preferring Class/Interface over Constructor
     // (fix #480: Java class and constructor share the same name).
@@ -1931,6 +2018,33 @@ export class LocalBackend {
     }
 
     if (!sym) return { error: `Target '${target}' not found` };
+
+    return this._runImpactBFS(repo, sym, symType, direction, {
+      maxDepth,
+      relationTypes,
+      includeTests,
+      minConfidence,
+    });
+  }
+
+  /**
+   * Shared BFS traversal for impact analysis (name-resolved or UID-resolved symbol).
+   */
+  private async _runImpactBFS(
+    repo: RepoHandle,
+    sym: any,
+    symType: string,
+    direction: 'upstream' | 'downstream',
+    opts: {
+      maxDepth: number;
+      relationTypes: string[];
+      includeTests: boolean;
+      minConfidence: number;
+    },
+  ): Promise<any> {
+    const { maxDepth, relationTypes, includeTests, minConfidence } = opts;
+    const relTypeFilter = relationTypes.map((t) => `'${t}'`).join(', ');
+    const confidenceFilter = minConfidence > 0 ? ` AND r.confidence >= ${minConfidence}` : '';
 
     const symId = sym.id || sym[0];
 
@@ -2336,6 +2450,132 @@ export class LocalBackend {
       affected_modules: affectedModules,
       byDepth: grouped,
     };
+  }
+
+  /**
+   * UID-based impact for cross-repo fan-out. Same result shape as `impact`.
+   * Returns null if the repo is unknown, the UID is missing, or analysis fails.
+   */
+  async impactByUid(
+    repoId: string,
+    uid: string,
+    direction: string,
+    opts: {
+      maxDepth: number;
+      relationTypes: string[];
+      minConfidence: number;
+      includeTests: boolean;
+    },
+  ): Promise<any | null> {
+    try {
+      await this.refreshRepos();
+      await this.ensureInitialized(repoId);
+    } catch {
+      return null;
+    }
+
+    const repo = this.repos.get(repoId);
+    if (!repo) return null;
+
+    const dir: 'upstream' | 'downstream' = direction === 'downstream' ? 'downstream' : 'upstream';
+
+    let rows: any[];
+    try {
+      rows = await executeParameterized(
+        repoId,
+        `MATCH (n) WHERE n.id = $uid
+         RETURN n.id AS id, n.name AS name, n.filePath AS filePath, labels(n)[0] AS type
+         LIMIT 1`,
+        { uid },
+      );
+    } catch {
+      return null;
+    }
+    if (!rows?.length) return null;
+
+    const sym = rows[0];
+    const labelRaw = sym.type ?? sym[3];
+    const symType =
+      typeof labelRaw === 'string' && labelRaw.trim().length > 0 ? labelRaw.trim() : '';
+
+    // Map legacy relation type names (backward compat for OVERRIDES → METHOD_OVERRIDES)
+    const mappedRelTypes = opts.relationTypes?.flatMap((t: string) =>
+      t === 'OVERRIDES' ? ['OVERRIDES', 'METHOD_OVERRIDES'] : [t],
+    );
+    const rawRelTypes =
+      mappedRelTypes && mappedRelTypes.length > 0
+        ? mappedRelTypes.filter((t: string) => VALID_RELATION_TYPES.has(t))
+        : [
+            'CALLS',
+            'IMPORTS',
+            'EXTENDS',
+            'IMPLEMENTS',
+            'METHOD_OVERRIDES',
+            'OVERRIDES',
+            'METHOD_IMPLEMENTS',
+          ];
+    const relationTypes =
+      rawRelTypes.length > 0
+        ? rawRelTypes
+        : [
+            'CALLS',
+            'IMPORTS',
+            'EXTENDS',
+            'IMPLEMENTS',
+            'METHOD_OVERRIDES',
+            'OVERRIDES',
+            'METHOD_IMPLEMENTS',
+          ];
+
+    try {
+      return await this._runImpactBFS(repo, sym, symType, dir, {
+        maxDepth: opts.maxDepth,
+        relationTypes,
+        includeTests: opts.includeTests,
+        minConfidence: opts.minConfidence,
+      });
+    } catch {
+      return null;
+    }
+  }
+
+  private handleGroupTool(method: string, params: Record<string, unknown>): Promise<unknown> {
+    switch (method) {
+      case 'group_list':
+        return this.groupList(params);
+      case 'group_sync':
+        return this.groupSync(params);
+      case 'group_contracts':
+        return this.groupContracts(params);
+      case 'group_query':
+        return this.groupQuery(params);
+      case 'group_status':
+        return this.groupStatus(params);
+      default:
+        throw new Error(`Unknown group tool: ${method}`);
+    }
+  }
+
+  private async groupList(params: Record<string, unknown>): Promise<unknown> {
+    return this.getGroupService().groupList(params);
+  }
+
+  private async groupSync(params: Record<string, unknown>): Promise<unknown> {
+    return this.getGroupService().groupSync(params);
+  }
+
+  private async groupContracts(params: Record<string, unknown>): Promise<unknown> {
+    return this.getGroupService().groupContracts(params);
+  }
+
+  private async groupQuery(params: Record<string, unknown>): Promise<unknown> {
+    await this.refreshRepos();
+    return this.getGroupService().groupQuery(params);
+  }
+
+  private async groupStatus(params: Record<string, unknown>): Promise<unknown> {
+    await this.refreshRepos();
+    return this.getGroupService().groupStatus(params);
   }
 
   /**

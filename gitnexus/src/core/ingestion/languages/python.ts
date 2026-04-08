@@ -11,6 +11,7 @@
  */
 
 import { SupportedLanguages } from 'gitnexus-shared';
+import { createClassExtractor } from '../class-extractors/generic.js';
 import { defineLanguage } from '../language-provider.js';
 import { typeConfig as pythonConfig } from '../type-extractors/python.js';
 import { pythonExportChecker } from '../export-detection.js';
@@ -19,6 +20,8 @@ import { extractPythonNamedBindings } from '../named-bindings/python.js';
 import { PYTHON_QUERIES } from '../tree-sitter-queries.js';
 import { createFieldExtractor } from '../field-extractors/generic.js';
 import { pythonConfig as pythonFieldConfig } from '../field-extractors/configs/python.js';
+import { createMethodExtractor } from '../method-extractors/generic.js';
+import { pythonMethodConfig } from '../method-extractors/configs/python.js';
 
 const BUILT_INS: ReadonlySet<string> = new Set([
   'print',
@@ -61,5 +64,11 @@ export const pythonProvider = defineLanguage({
   importSemantics: 'namespace',
   mroStrategy: 'c3',
   fieldExtractor: createFieldExtractor(pythonFieldConfig),
+  methodExtractor: createMethodExtractor(pythonMethodConfig),
+  classExtractor: createClassExtractor({
+    language: SupportedLanguages.Python,
+    typeDeclarationNodes: ['class_definition'],
+    ancestorScopeNodeTypes: ['class_definition'],
+  }),
   builtInNames: BUILT_INS,
 });
