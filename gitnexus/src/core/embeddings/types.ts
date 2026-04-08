@@ -5,10 +5,39 @@
  */
 
 /**
- * Node labels that should be embedded for semantic search
- * These are code elements that benefit from semantic matching
+ * Node labels that need chunking (have code body, potentially long)
  */
-export const EMBEDDABLE_LABELS = ['Function', 'Class', 'Method', 'Interface', 'File'] as const;
+export const CHUNKABLE_LABELS = [
+  'Function',
+  'Method',
+  'Class',
+  'Interface',
+  'Struct',
+  'Enum',
+  'Trait',
+  'Impl',
+  'Macro',
+  'Namespace',
+] as const;
+
+/**
+ * Node labels that are short (no chunking needed, embed directly)
+ */
+export const SHORT_LABELS = [
+  'TypeAlias',
+  'Typedef',
+  'Const',
+  'Property',
+  'Record',
+  'Union',
+  'Static',
+  'Variable',
+] as const;
+
+/**
+ * All embeddable labels (union of CHUNKABLE + SHORT)
+ */
+export const EMBEDDABLE_LABELS = [...CHUNKABLE_LABELS, ...SHORT_LABELS] as const;
 
 export type EmbeddableLabel = (typeof EMBEDDABLE_LABELS)[number];
 
@@ -17,6 +46,29 @@ export type EmbeddableLabel = (typeof EMBEDDABLE_LABELS)[number];
  */
 export const isEmbeddableLabel = (label: string): label is EmbeddableLabel =>
   EMBEDDABLE_LABELS.includes(label as EmbeddableLabel);
+
+/**
+ * Check if a label needs chunking
+ */
+export const isChunkableLabel = (label: string): boolean =>
+  (CHUNKABLE_LABELS as readonly string[]).includes(label);
+
+/**
+ * Check if a label is a short type (no chunking)
+ */
+export const isShortLabel = (label: string): boolean =>
+  (SHORT_LABELS as readonly string[]).includes(label);
+
+/**
+ * Node labels that have isExported column in their schema
+ */
+export const LABELS_WITH_EXPORTED = new Set([
+  'Function',
+  'Class',
+  'Interface',
+  'Method',
+  'CodeElement',
+]) as ReadonlySet<string>;
 
 /**
  * Embedding pipeline phases
@@ -57,6 +109,12 @@ export interface EmbeddingConfig {
   device: 'auto' | 'dml' | 'cuda' | 'cpu' | 'wasm';
   /** Maximum characters of code snippet to include */
   maxSnippetLength: number;
+  /** Maximum code chunk size in characters (for chunking long code) */
+  chunkSize: number;
+  /** Overlap between chunks in characters */
+  overlap: number;
+  /** Maximum description length in characters */
+  maxDescriptionLength: number;
 }
 
 /**
@@ -70,6 +128,9 @@ export const DEFAULT_EMBEDDING_CONFIG: EmbeddingConfig = {
   dimensions: 384,
   device: 'auto',
   maxSnippetLength: 500,
+  chunkSize: 1200,
+  overlap: 120,
+  maxDescriptionLength: 150,
 };
 
 /**
@@ -96,6 +157,31 @@ export interface EmbeddableNode {
   content: string;
   startLine?: number;
   endLine?: number;
+  isExported?: boolean;
+  description?: string;
+  parameterCount?: number;
+  returnType?: string;
+  repoName?: string;
+  serverName?: string;
+}
+
+/**
+ * Cached embedding entry restored from LadybugDB before a graph rebuild
+ */
+export interface CachedEmbedding {
+  nodeId: string;
+  chunkIndex: number;
+  startLine: number;
+  endLine: number;
+  embedding: number[];
+}
+
+/**
+ * Context info for embedding pipeline (repo/server metadata enrichment)
+ */
+export interface EmbeddingContext {
+  repoName?: string;
+  serverName?: string;
 }
 
 /**

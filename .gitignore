@@ -96,3 +96,8 @@ GitNexus.sln
 .swarm/
 
 local_docs/
+
+.cursor
+.github
+openspec
+CLAUDE.md

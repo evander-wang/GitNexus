@@ -1,206 +1,239 @@
 /**
  * Text Generator Module
  *
- * Pure functions to generate embedding text from code nodes.
- * Combines node metadata with code snippets for semantic matching.
+ * Generates enriched embedding text from code nodes with metadata.
+ * Supports chunkable labels (Function/Method with AST chunking),
+ * Class-specific structural text, and short-node direct embed.
  */
 
 import type { EmbeddableNode, EmbeddingConfig } from './types.js';
-import { DEFAULT_EMBEDDING_CONFIG } from './types.js';
+import { DEFAULT_EMBEDDING_CONFIG, isShortLabel } from './types.js';
 
 /**
- * Extract the filename from a file path
+ * Truncate description to max length at sentence/word boundary
  */
-const getFileName = (filePath: string): string => {
-  const parts = filePath.split('/');
-  return parts[parts.length - 1] || filePath;
-};
+const truncateDescription = (text: string, maxLength: number): string => {
+  if (text.length <= maxLength) return text;
 
-/**
- * Extract the directory path from a file path
- */
-const getDirectory = (filePath: string): string => {
-  const parts = filePath.split('/');
-  parts.pop();
-  return parts.join('/') || '';
-};
+  const truncated = text.slice(0, maxLength);
 
-/**
- * Truncate content to max length, preserving word boundaries
- */
-const truncateContent = (content: string, maxLength: number): string => {
-  if (content.length <= maxLength) {
-    return content;
+  // Try sentence boundary (. ! ?)
+  const sentenceEnd = Math.max(
+    truncated.lastIndexOf('. '),
+    truncated.lastIndexOf('! '),
+    truncated.lastIndexOf('? '),
+  );
+  if (sentenceEnd > maxLength * 0.5) {
+    return truncated.slice(0, sentenceEnd + 1);
   }
 
-  // Find last space before maxLength to avoid cutting words
-  const truncated = content.slice(0, maxLength);
+  // Try word boundary
   const lastSpace = truncated.lastIndexOf(' ');
-
-  if (lastSpace > maxLength * 0.8) {
-    return truncated.slice(0, lastSpace) + '...';
+  if (lastSpace > maxLength * 0.5) {
+    return truncated.slice(0, lastSpace);
   }
 
-  return truncated + '...';
+  return truncated;
 };
 
 /**
  * Clean code content for embedding
- * Removes excessive whitespace while preserving structure
  */
 const cleanContent = (content: string): string => {
-  return (
-    content
-      // Normalize line endings
-      .replace(/\r\n/g, '\n')
-      // Remove excessive blank lines (more than 2)
-      .replace(/\n{3,}/g, '\n\n')
-      // Trim each line
-      .split('\n')
-      .map((line) => line.trimEnd())
-      .join('\n')
-      .trim()
-  );
+  return content
+    .replace(/\r\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .split('\n')
+    .map((line) => line.trimEnd())
+    .join('\n')
+    .trim();
 };
 
 /**
- * Generate embedding text for a Function node
+ * Build metadata header for a node
  */
-const generateFunctionText = (node: EmbeddableNode, maxSnippetLength: number): string => {
-  const parts: string[] = [`Function: ${node.name}`, `File: ${getFileName(node.filePath)}`];
+const buildMetadataHeader = (node: EmbeddableNode, config: Partial<EmbeddingConfig>): string => {
+  const parts: string[] = [];
 
-  const dir = getDirectory(node.filePath);
-  if (dir) {
-    parts.push(`Directory: ${dir}`);
+  // Label + name
+  parts.push(`${node.label}: ${node.name}`);
+
+  // Repo name
+  if (node.repoName) {
+    parts.push(`Repo: ${node.repoName}`);
   }
 
-  if (node.content) {
-    const cleanedContent = cleanContent(node.content);
-    const snippet = truncateContent(cleanedContent, maxSnippetLength);
-    parts.push('', snippet);
+  // Server name (optional)
+  if (node.serverName) {
+    parts.push(`Server: ${node.serverName}`);
+  }
+
+  // Full file path
+  parts.push(`Path: ${node.filePath}`);
+
+  // Export status
+  if (node.isExported !== undefined) {
+    parts.push(`Export: ${node.isExported}`);
+  }
+
+  // Description (truncated)
+  if (node.description) {
+    const maxLen = config.maxDescriptionLength ?? DEFAULT_EMBEDDING_CONFIG.maxDescriptionLength;
+    const truncated = truncateDescription(node.description, maxLen);
+    if (truncated) {
+      parts.push(truncated);
+    }
   }
 
   return parts.join('\n');
 };
 
 /**
- * Generate embedding text for a Class node
+ * Generate embedding text for Function/Method nodes
+ * Includes metadata header + code body (chunk text passed separately)
  */
-const generateClassText = (node: EmbeddableNode, maxSnippetLength: number): string => {
-  const parts: string[] = [`Class: ${node.name}`, `File: ${getFileName(node.filePath)}`];
+const generateFunctionText = (
+  node: EmbeddableNode,
+  codeBody: string,
+  config: Partial<EmbeddingConfig>,
+): string => {
+  const header = buildMetadataHeader(node, config);
+  const cleaned = cleanContent(codeBody);
+  return `${header}\n\n${cleaned}`;
+};
 
-  const dir = getDirectory(node.filePath);
-  if (dir) {
-    parts.push(`Directory: ${dir}`);
+/**
+ * Generate embedding text for Class nodes
+ * Signature + properties + method name list only (no method bodies)
+ *
+ * NOTE: Method/property regex is currently tuned for JS/TS syntax.
+ * Multi-language support (Python, Kotlin, Rust, etc.) is a TODO.
+ */
+const generateClassText = (
+  node: EmbeddableNode,
+  codeBody: string,
+  config: Partial<EmbeddingConfig>,
+): string => {
+  const header = buildMetadataHeader(node, config);
+  const parts: string[] = [header];
+
+  // Extract method names and properties from content
+  const cleaned = cleanContent(codeBody);
+  const lines = cleaned.split('\n');
+
+  const methods: string[] = [];
+  const properties: string[] = [];
+  const classBodyLines: string[] = [];
+  let inClass = false;
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    // Detect class opening (JS/TS only — Python `class Foo:`, Kotlin `class Foo` etc. are not yet handled)
+    if (
+      trimmed.match(/^(?:export\s+)?(?:abstract\s+)?class\s/) ||
+      trimmed.startsWith('data class ')
+    ) {
+      inClass = true;
+      classBodyLines.push(trimmed);
+      continue;
+    }
+    if (!inClass) {
+      classBodyLines.push(trimmed);
+      continue;
+    }
+
+    // Extract method names
+    const methodMatch = trimmed.match(
+      /^(?:public|private|protected|static|async|abstract|\s)*\s*(\w+)\s*\(/,
+    );
+    if (methodMatch && !trimmed.startsWith('//') && !trimmed.startsWith('*')) {
+      methods.push(methodMatch[1]);
+    }
+
+    // Extract property declarations
+    const propMatch = trimmed.match(
+      /^(?:public|private|protected|static|readonly)\s+(\w+)\s*[=:(]/,
+    );
+    if (propMatch) {
+      properties.push(propMatch[1]);
+    }
+
+    // Keep class declaration + property lines (no method bodies)
+    if (
+      trimmed.match(/^(?:export\s+)?(?:abstract\s+)?class\s/) ||
+      trimmed.startsWith('data class ') ||
+      trimmed.startsWith('{') ||
+      trimmed.startsWith('}') ||
+      trimmed === '' ||
+      propMatch ||
+      trimmed.endsWith(';') ||
+      !trimmed.includes('{')
+    ) {
+      classBodyLines.push(trimmed);
+    }
   }
 
-  if (node.content) {
-    const cleanedContent = cleanContent(node.content);
-    const snippet = truncateContent(cleanedContent, maxSnippetLength);
-    parts.push('', snippet);
+  if (methods.length > 0) parts.push(`Methods: ${methods.join(', ')}`);
+  if (properties.length > 0) parts.push(`Properties: ${properties.join(', ')}`);
+
+  // Class declaration only (no method bodies)
+  const declarationOnly = classBodyLines.join('\n').trim();
+  if (declarationOnly) {
+    parts.push('', declarationOnly);
   }
 
   return parts.join('\n');
 };
 
 /**
- * Generate embedding text for a Method node
+ * Generate embedding text for short nodes (TypeAlias, Const, etc.)
+ * No chunking, just metadata + full content
  */
-const generateMethodText = (node: EmbeddableNode, maxSnippetLength: number): string => {
-  const parts: string[] = [`Method: ${node.name}`, `File: ${getFileName(node.filePath)}`];
-
-  const dir = getDirectory(node.filePath);
-  if (dir) {
-    parts.push(`Directory: ${dir}`);
-  }
-
-  if (node.content) {
-    const cleanedContent = cleanContent(node.content);
-    const snippet = truncateContent(cleanedContent, maxSnippetLength);
-    parts.push('', snippet);
-  }
-
-  return parts.join('\n');
+const generateShortNodeText = (node: EmbeddableNode, config: Partial<EmbeddingConfig>): string => {
+  const header = buildMetadataHeader(node, config);
+  const cleaned = cleanContent(node.content);
+  return `${header}\n\n${cleaned}`;
 };
 
 /**
- * Generate embedding text for an Interface node
+ * Generate embedding text for Interface/Struct/Enum/Trait/etc. (chunkable but non-function)
  */
-const generateInterfaceText = (node: EmbeddableNode, maxSnippetLength: number): string => {
-  const parts: string[] = [`Interface: ${node.name}`, `File: ${getFileName(node.filePath)}`];
-
-  const dir = getDirectory(node.filePath);
-  if (dir) {
-    parts.push(`Directory: ${dir}`);
-  }
-
-  if (node.content) {
-    const cleanedContent = cleanContent(node.content);
-    const snippet = truncateContent(cleanedContent, maxSnippetLength);
-    parts.push('', snippet);
-  }
-
-  return parts.join('\n');
-};
-
-/**
- * Generate embedding text for a File node
- * Uses file name and first N characters of content
- */
-const generateFileText = (node: EmbeddableNode, maxSnippetLength: number): string => {
-  const parts: string[] = [`File: ${node.name}`, `Path: ${node.filePath}`];
-
-  if (node.content) {
-    const cleanedContent = cleanContent(node.content);
-    // For files, use a shorter snippet since they can be very long
-    const snippet = truncateContent(cleanedContent, Math.min(maxSnippetLength, 300));
-    parts.push('', snippet);
-  }
-
-  return parts.join('\n');
+const generateChunkableNonFunctionText = (
+  node: EmbeddableNode,
+  codeBody: string,
+  config: Partial<EmbeddingConfig>,
+): string => {
+  const header = buildMetadataHeader(node, config);
+  const cleaned = cleanContent(codeBody);
+  return `${header}\n\n${cleaned}`;
 };
 
 /**
  * Generate embedding text for any embeddable node
  * Dispatches to the appropriate generator based on node label
- *
- * @param node - The node to generate text for
- * @param config - Optional configuration for max snippet length
- * @returns Text suitable for embedding
  */
 export const generateEmbeddingText = (
   node: EmbeddableNode,
+  codeBody: string,
   config: Partial<EmbeddingConfig> = {},
 ): string => {
-  const maxSnippetLength = config.maxSnippetLength ?? DEFAULT_EMBEDDING_CONFIG.maxSnippetLength;
-
-  switch (node.label) {
-    case 'Function':
-      return generateFunctionText(node, maxSnippetLength);
-    case 'Class':
-      return generateClassText(node, maxSnippetLength);
-    case 'Method':
-      return generateMethodText(node, maxSnippetLength);
-    case 'Interface':
-      return generateInterfaceText(node, maxSnippetLength);
-    case 'File':
-      return generateFileText(node, maxSnippetLength);
-    default:
-      // Fallback for any other embeddable type
-      return `${node.label}: ${node.name}\nPath: ${node.filePath}`;
+  if (isShortLabel(node.label)) {
+    return generateShortNodeText(node, config);
   }
+
+  if (node.label === 'Class') {
+    return generateClassText(node, codeBody, config);
+  }
+
+  if (node.label === 'Function' || node.label === 'Method') {
+    return generateFunctionText(node, codeBody, config);
+  }
+
+  // Other chunkable types (Interface, Struct, Enum, Trait, Impl, Macro, Namespace)
+  return generateChunkableNonFunctionText(node, codeBody, config);
 };
 
 /**
- * Generate embedding texts for a batch of nodes
- *
- * @param nodes - Array of nodes to generate text for
- * @param config - Optional configuration
- * @returns Array of texts in the same order as input nodes
+ * Export truncation helper for testing
  */
-export const generateBatchEmbeddingTexts = (
-  nodes: EmbeddableNode[],
-  config: Partial<EmbeddingConfig> = {},
-): string[] => {
-  return nodes.map((node) => generateEmbeddingText(node, config));
-};
+export { truncateDescription };

@@ -807,12 +807,13 @@ export class LocalBackend {
       const queryVecStr = `[${queryVec.join(',')}]`;
 
       const vectorQuery = `
-        CALL QUERY_VECTOR_INDEX('CodeEmbedding', 'code_embedding_idx', 
+        CALL QUERY_VECTOR_INDEX('CodeEmbedding', 'code_embedding_idx',
           CAST(${queryVecStr} AS FLOAT[${dims}]), ${limit})
         YIELD node AS emb, distance
         WITH emb, distance
         WHERE distance < 0.6
-        RETURN emb.nodeId AS nodeId, distance
+        RETURN emb.nodeId AS nodeId, emb.chunkIndex AS chunkIndex,
+               emb.startLine AS chunkStartLine, emb.endLine AS chunkEndLine, distance
         ORDER BY distance
       `;
 
@@ -820,12 +821,26 @@ export class LocalBackend {
 
       if (embResults.length === 0) return [];
 
+      // Deduplicate by nodeId — keep chunk with smallest distance
+      const bestChunks = new Map<
+        string,
+        { chunkIndex: number; startLine: number; endLine: number; distance: number }
+      >();
+      for (const row of embResults) {
+        const nodeId = row.nodeId ?? row[0];
+        const chunkIndex = row.chunkIndex ?? row[1] ?? 0;
+        const startLine = row.chunkStartLine ?? row[2] ?? 0;
+        const endLine = row.chunkEndLine ?? row[3] ?? 0;
+        const distance = row.distance ?? row[4];
+        const existing = bestChunks.get(nodeId);
+        if (!existing || distance < existing.distance) {
+          bestChunks.set(nodeId, { chunkIndex, startLine, endLine, distance });
+        }
+      }
+
       const results: any[] = [];
 
-      for (const embRow of embResults) {
-        const nodeId = embRow.nodeId ?? embRow[0];
-        const distance = embRow.distance ?? embRow[1];
-
+      for (const [nodeId, chunk] of bestChunks) {
         const labelEndIdx = nodeId.indexOf(':');
         const label = labelEndIdx > 0 ? nodeId.substring(0, labelEndIdx) : 'Unknown';
 
@@ -836,7 +851,7 @@ export class LocalBackend {
           const nodeQuery =
             label === 'File'
               ? `MATCH (n:File {id: $nodeId}) RETURN n.name AS name, n.filePath AS filePath`
-              : `MATCH (n:\`${label}\` {id: $nodeId}) RETURN n.name AS name, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine`;
+              : `MATCH (n:\`${label}\` {id: $nodeId}) RETURN n.name AS name, n.filePath AS filePath`;
 
           const nodeRows = await executeParameterized(repo.id, nodeQuery, { nodeId });
           if (nodeRows.length > 0) {
@@ -846,9 +861,9 @@ export class LocalBackend {
               name: nodeRow.name ?? nodeRow[0] ?? '',
               type: label,
               filePath: nodeRow.filePath ?? nodeRow[1] ?? '',
-              distance,
-              startLine: label !== 'File' ? (nodeRow.startLine ?? nodeRow[2]) : undefined,
-              endLine: label !== 'File' ? (nodeRow.endLine ?? nodeRow[3]) : undefined,
+              distance: chunk.distance,
+              startLine: chunk.startLine,
+              endLine: chunk.endLine,
             });
           }
         } catch {}

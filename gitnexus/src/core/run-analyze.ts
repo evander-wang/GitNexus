@@ -31,6 +31,7 @@ import {
   cleanupOldKuzuFiles,
 } from '../storage/repo-manager.js';
 import { getCurrentCommit, hasGitDir } from '../storage/git.js';
+import type { CachedEmbedding } from './embeddings/types.js';
 import { generateAIContextFiles } from '../cli/ai-context.js';
 
 // ---------------------------------------------------------------------------
@@ -136,7 +137,7 @@ export async function runFullAnalysis(
 
   // ── Cache embeddings from existing index before rebuild ────────────
   let cachedEmbeddingNodeIds = new Set<string>();
-  let cachedEmbeddings: Array<{ nodeId: string; embedding: number[] }> = [];
+  let cachedEmbeddings: CachedEmbedding[] = [];
 
   if (options.embeddings && existingMeta && !options.force) {
     try {
@@ -214,15 +215,13 @@ export async function runFullAnalysis(
         cachedEmbeddingNodeIds = new Set();
       } else {
         progress('embeddings', 88, `Restoring ${cachedEmbeddings.length} cached embeddings...`);
+        const { batchInsertEmbeddings: batchInsert } =
+          await import('./embeddings/embedding-pipeline.js');
         const EMBED_BATCH = 200;
         for (let i = 0; i < cachedEmbeddings.length; i += EMBED_BATCH) {
           const batch = cachedEmbeddings.slice(i, i + EMBED_BATCH);
-          const paramsList = batch.map((e) => ({ nodeId: e.nodeId, embedding: e.embedding }));
           try {
-            await executeWithReusedStatement(
-              `CREATE (e:CodeEmbedding {nodeId: $nodeId, embedding: $embedding})`,
-              paramsList,
-            );
+            await batchInsert(executeWithReusedStatement, batch);
           } catch {
             /* some may fail if node was removed, that's fine */
           }
@@ -249,6 +248,9 @@ export async function runFullAnalysis(
         httpMode ? 'Connecting to embedding endpoint...' : 'Loading embedding model...',
       );
       const { runEmbeddingPipeline } = await import('./embeddings/embedding-pipeline.js');
+      const { readServerMapping } = await import('./embeddings/server-mapping.js');
+      const projectName = path.basename(repoPath);
+      const serverName = await readServerMapping(projectName);
       await runEmbeddingPipeline(
         executeQuery,
         executeWithReusedStatement,
@@ -264,6 +266,7 @@ export async function runFullAnalysis(
         },
         {},
         cachedEmbeddingNodeIds.size > 0 ? cachedEmbeddingNodeIds : undefined,
+        { repoName: projectName, serverName },
       );
     }
 
