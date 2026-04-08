@@ -12,6 +12,7 @@ import {
   NodeTableName,
 } from './schema.js';
 import { streamAllCSVsToDisk } from './csv-generator.js';
+import type { CachedEmbedding } from '../embeddings/types.js';
 
 let db: lbug.Database | null = null;
 let conn: lbug.Connection | null = null;
@@ -727,30 +728,49 @@ export const getLbugStats = async (): Promise<{ nodes: number; edges: number }> 
  * Load cached embeddings from LadybugDB before a rebuild.
  * Returns all embedding vectors so they can be re-inserted after the graph is reloaded,
  * avoiding expensive re-embedding of unchanged nodes.
+ *
+ * Detects old schema (no chunkIndex column) and returns empty cache to trigger rebuild.
  */
 export const loadCachedEmbeddings = async (): Promise<{
   embeddingNodeIds: Set<string>;
-  embeddings: Array<{ nodeId: string; embedding: number[] }>;
+  embeddings: CachedEmbedding[];
 }> => {
   if (!conn) {
     return { embeddingNodeIds: new Set(), embeddings: [] };
   }
 
   const embeddingNodeIds = new Set<string>();
-  const embeddings: Array<{ nodeId: string; embedding: number[] }> = [];
+  const embeddings: CachedEmbedding[] = [];
+
   try {
+    // Schema migration detection: query with new columns to verify schema version.
+    // Old schema only had (nodeId, embedding); new schema adds (id, chunkIndex, startLine, endLine).
+    // If the query fails (column missing), we return empty cache to force a full rebuild.
+    try {
+      const check = await conn.query(
+        `MATCH (e:${EMBEDDING_TABLE_NAME}) RETURN e.nodeId AS nodeId, e.chunkIndex AS chunkIndex LIMIT 1`,
+      );
+      const checkResult = Array.isArray(check) ? check[0] : check;
+      await checkResult.getAll();
+    } catch {
+      return { embeddingNodeIds: new Set(), embeddings: [] };
+    }
+
     const rows = await conn.query(
-      `MATCH (e:${EMBEDDING_TABLE_NAME}) RETURN e.nodeId AS nodeId, e.embedding AS embedding`,
+      `MATCH (e:${EMBEDDING_TABLE_NAME}) RETURN e.nodeId AS nodeId, e.chunkIndex AS chunkIndex, e.startLine AS startLine, e.endLine AS endLine, e.embedding AS embedding`,
     );
     const result = Array.isArray(rows) ? rows[0] : rows;
     for (const row of await result.getAll()) {
       const nodeId = String(row.nodeId ?? row[0] ?? '');
       if (!nodeId) continue;
       embeddingNodeIds.add(nodeId);
-      const embedding = row.embedding ?? row[1];
+      const embedding = row.embedding ?? row[4];
       if (embedding) {
         embeddings.push({
           nodeId,
+          chunkIndex: Number(row.chunkIndex ?? row[1] ?? 0),
+          startLine: Number(row.startLine ?? row[2] ?? 0),
+          endLine: Number(row.endLine ?? row[3] ?? 0),
           embedding: Array.isArray(embedding)
             ? embedding.map(Number)
             : Array.from(embedding as any).map(Number),
