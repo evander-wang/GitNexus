@@ -3,6 +3,7 @@ import {
   generateEmbeddingText,
   truncateDescription,
 } from '../../src/core/embeddings/text-generator.js';
+import { isChunkableLabel } from '../../src/core/embeddings/types.js';
 import type { EmbeddableNode } from '../../src/core/embeddings/types.js';
 
 const baseNode: EmbeddableNode = {
@@ -86,6 +87,24 @@ describe('text-generator', () => {
       expect(text).toContain('validate');
       expect(text).toContain('Properties:');
       expect(text).toContain('options');
+    });
+  });
+
+  describe('Constructor label', () => {
+    it('is recognized as chunkable', () => {
+      expect(isChunkableLabel('Constructor')).toBe(true);
+    });
+
+    it('is recognized as embeddable', () => {
+      const node: EmbeddableNode = {
+        ...baseNode,
+        label: 'Constructor',
+        name: 'constructor',
+        content: 'constructor(private service: ApiClient) {\n  this.service = service;\n}',
+      };
+      const text = generateEmbeddingText(node, node.content);
+      expect(text).toContain('Constructor: constructor');
+      expect(text).toContain('this.service = service');
     });
   });
 

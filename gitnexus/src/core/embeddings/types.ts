@@ -10,6 +10,7 @@
 export const CHUNKABLE_LABELS = [
   'Function',
   'Method',
+  'Constructor',
   'Class',
   'Interface',
   'Struct',

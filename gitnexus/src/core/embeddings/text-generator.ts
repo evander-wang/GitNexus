@@ -103,6 +103,19 @@ const generateFunctionText = (
 };
 
 /**
+ * Generate embedding text for Constructor nodes
+ */
+const generateConstructorText = (
+  node: EmbeddableNode,
+  codeBody: string,
+  config: Partial<EmbeddingConfig>,
+): string => {
+  const header = buildMetadataHeader(node, config);
+  const cleaned = cleanContent(codeBody);
+  return `${header}\n\n${cleaned}`;
+};
+
+/**
  * Generate embedding text for Class nodes
  * Signature + properties + method name list only (no method bodies)
  *
@@ -223,6 +236,10 @@ export const generateEmbeddingText = (
 
   if (node.label === 'Class') {
     return generateClassText(node, codeBody, config);
+  }
+
+  if (node.label === 'Constructor') {
+    return generateConstructorText(node, codeBody, config);
   }
 
   if (node.label === 'Function' || node.label === 'Method') {
