@@ -2,15 +2,22 @@
  * Chunker Module
  *
  * Splits code nodes into chunks for embedding.
- * - Function/Method/Constructor: AST-aware chunking by statement boundaries
+ * - Function/Method: AST-aware chunking by statement boundaries
  * - Other types: character-based sliding window fallback
  * - Short content (≤ chunkSize): no chunking
  */
+
+import { getLanguageFromFilename } from 'gitnexus-shared';
 
 export { type Chunk, characterChunk } from './character-chunk.js';
 
 import { characterChunk } from './character-chunk.js';
 import type { Chunk } from './character-chunk.js';
+
+// Module-level parser cache — safe because Parser is stateless
+// and language grammars are read-only
+let parserInstance: any = null;
+const loadedLanguages = new Set<string>();
 
 /**
  * Main chunkNode function: dispatches by label
@@ -55,17 +62,24 @@ const astChunk = async (
   chunkSize: number,
   overlap: number,
 ): Promise<Chunk[]> => {
-  const { getLanguageFromFilename } = await import('gitnexus-shared');
   const language = getLanguageFromFilename(filePath);
   if (!language) return [];
 
   const { loadParser, loadLanguage, isLanguageAvailable } =
     await import('../tree-sitter/parser-loader.js');
   if (!isLanguageAvailable(language)) return [];
-  const parser = await loadParser();
-  await loadLanguage(language, filePath);
 
-  const tree = parser.parse(content);
+  // Use cached parser — only init once
+  if (!parserInstance) {
+    parserInstance = await loadParser();
+  }
+  // Only load each language once
+  if (!loadedLanguages.has(language)) {
+    await loadLanguage(language, filePath);
+    loadedLanguages.add(language);
+  }
+
+  const tree = parserInstance.parse(content);
   const root = tree.rootNode;
 
   // Find the node matching our startLine/endLine (0-based in tree-sitter)
@@ -163,7 +177,16 @@ const findNodeByRange = (node: any, startLine: number, endLine: number): any | n
   return null;
 };
 
+/**
+ * Extract overlap text with line-boundary awareness.
+ * Prefers starting at a newline to avoid splitting mid-identifier.
+ */
 const overlapText = (text: string, overlapSize: number): string => {
   if (text.length <= overlapSize) return text;
-  return text.slice(text.length - overlapSize);
+  const start = text.length - overlapSize;
+  const newlineIdx = text.indexOf('\n', start);
+  if (newlineIdx >= 0 && newlineIdx < start + 50) {
+    return text.slice(newlineIdx + 1);
+  }
+  return text.slice(start);
 };
