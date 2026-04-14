@@ -8,6 +8,8 @@
 
 import type { EmbeddableNode, EmbeddingConfig } from './types.js';
 import { DEFAULT_EMBEDDING_CONFIG, isShortLabel } from './types.js';
+import { getLanguageFromFilename } from 'gitnexus-shared';
+import { getPatternsForLanguage } from './language-patterns.js';
 
 /**
  * Truncate description to max length at sentence/word boundary
@@ -118,9 +120,7 @@ const generateConstructorText = (
 /**
  * Generate embedding text for Class nodes
  * Signature + properties + method name list only (no method bodies)
- *
- * NOTE: Method/property regex is currently tuned for JS/TS syntax.
- * Multi-language support (Python, Kotlin, Rust, etc.) is a TODO.
+ * Multi-language: dispatches to language-patterns for method/property extraction.
  */
 const generateClassText = (
   node: EmbeddableNode,
@@ -130,72 +130,94 @@ const generateClassText = (
   const header = buildMetadataHeader(node, config);
   const parts: string[] = [header];
 
-  // Extract method names and properties from content
   const cleaned = cleanContent(codeBody);
-  const lines = cleaned.split('\n');
 
-  const methods: string[] = [];
-  const properties: string[] = [];
-  const classBodyLines: string[] = [];
-  let inClass = false;
+  // Try language-specific patterns first
+  const language = getLanguageFromFilename(node.filePath);
+  const patterns = language ? getPatternsForLanguage(language) : undefined;
 
-  for (const line of lines) {
-    const trimmed = line.trim();
-    // Detect class opening (JS/TS only — Python `class Foo:`, Kotlin `class Foo` etc. are not yet handled)
-    if (
-      trimmed.match(/^(?:export\s+)?(?:abstract\s+)?class\s/) ||
-      trimmed.startsWith('data class ')
-    ) {
-      inClass = true;
-      classBodyLines.push(trimmed);
-      continue;
-    }
-    if (!inClass) {
-      classBodyLines.push(trimmed);
-      continue;
+  if (patterns) {
+    const methods = patterns.extractMethods(cleaned);
+    const properties = patterns.extractProperties(cleaned);
+    if (methods.length > 0) parts.push(`Methods: ${methods.join(', ')}`);
+    if (properties.length > 0) parts.push(`Properties: ${properties.join(', ')}`);
+  } else {
+    // Fallback: original JS/TS regex
+    const methods: string[] = [];
+    const properties: string[] = [];
+    const lines = cleaned.split('\n');
+    let inClass = false;
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (
+        trimmed.match(/^(?:export\s+)?(?:abstract\s+)?class\s/) ||
+        trimmed.startsWith('data class ')
+      ) {
+        inClass = true;
+        continue;
+      }
+      if (!inClass) continue;
+
+      const methodMatch = trimmed.match(
+        /^(?:public|private|protected|static|async|abstract|\s)*\s*(\w+)\s*\(/,
+      );
+      if (methodMatch && !trimmed.startsWith('//') && !trimmed.startsWith('*')) {
+        methods.push(methodMatch[1]);
+      }
+
+      const propMatch = trimmed.match(
+        /^(?:public|private|protected|static|readonly)\s+(\w+)\s*[=:(]/,
+      );
+      if (propMatch) {
+        properties.push(propMatch[1]);
+      }
     }
 
-    // Extract method names
-    const methodMatch = trimmed.match(
-      /^(?:public|private|protected|static|async|abstract|\s)*\s*(\w+)\s*\(/,
-    );
-    if (methodMatch && !trimmed.startsWith('//') && !trimmed.startsWith('*')) {
-      methods.push(methodMatch[1]);
-    }
-
-    // Extract property declarations
-    const propMatch = trimmed.match(
-      /^(?:public|private|protected|static|readonly)\s+(\w+)\s*[=:(]/,
-    );
-    if (propMatch) {
-      properties.push(propMatch[1]);
-    }
-
-    // Keep class declaration + property lines (no method bodies)
-    if (
-      trimmed.match(/^(?:export\s+)?(?:abstract\s+)?class\s/) ||
-      trimmed.startsWith('data class ') ||
-      trimmed.startsWith('{') ||
-      trimmed.startsWith('}') ||
-      trimmed === '' ||
-      propMatch ||
-      trimmed.endsWith(';') ||
-      !trimmed.includes('{')
-    ) {
-      classBodyLines.push(trimmed);
-    }
+    if (methods.length > 0) parts.push(`Methods: ${methods.join(', ')}`);
+    if (properties.length > 0) parts.push(`Properties: ${properties.join(', ')}`);
   }
 
-  if (methods.length > 0) parts.push(`Methods: ${methods.join(', ')}`);
-  if (properties.length > 0) parts.push(`Properties: ${properties.join(', ')}`);
-
   // Class declaration only (no method bodies)
-  const declarationOnly = classBodyLines.join('\n').trim();
+  const declarationOnly = extractDeclarationOnly(cleaned);
   if (declarationOnly) {
     parts.push('', declarationOnly);
   }
 
   return parts.join('\n');
+};
+
+/**
+ * Extract class/interface/struct declaration lines (no method bodies)
+ */
+const extractDeclarationOnly = (content: string): string => {
+  const lines = content.split('\n');
+  const declLines: string[] = [];
+  let depth = 0;
+  let started = false;
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (
+      !started &&
+      (trimmed.match(/^(?:export\s+)?(?:abstract\s+)?(?:data\s+)?class\s/) ||
+        trimmed.match(/^(?:pub\s+)?struct\s/) ||
+        trimmed.match(/^(?:pub\s+)?enum\s/) ||
+        trimmed.match(/^type\s+\w+\s+struct/) ||
+        trimmed.match(/^class\s/) ||
+        trimmed.match(/^interface\s/))
+    ) {
+      started = true;
+    }
+    if (started) {
+      depth += (trimmed.match(/\{/g) || []).length;
+      depth -= (trimmed.match(/\}/g) || []).length;
+      declLines.push(trimmed);
+      if (depth <= 0 && declLines.length > 1) break;
+    }
+  }
+
+  return declLines.join('\n').trim();
 };
 
 /**

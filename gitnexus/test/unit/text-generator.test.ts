@@ -108,6 +108,80 @@ describe('text-generator', () => {
     });
   });
 
+  describe('multi-language class text', () => {
+    it('extracts methods from Python class', () => {
+      const node: EmbeddableNode = {
+        id: 'Class:src/models.py:User',
+        name: 'User',
+        label: 'Class',
+        filePath: 'src/models/user.py',
+        content: `class User:
+    def __init__(self, name):
+        self.name = name
+
+    def get_full_name(self):
+        return self.name`,
+      };
+      const text = generateEmbeddingText(node, node.content);
+      expect(text).toContain('Class: User');
+      expect(text).toContain('Methods:');
+      expect(text).toContain('__init__');
+      expect(text).toContain('get_full_name');
+    });
+
+    it('extracts methods from Kotlin class', () => {
+      const node: EmbeddableNode = {
+        id: 'Class:User.kt:User',
+        name: 'User',
+        label: 'Class',
+        filePath: 'src/models/User.kt',
+        content: `class User(val name: String) {
+    fun greet(): String = "Hello"
+    private fun validate() { }
+}`,
+      };
+      const text = generateEmbeddingText(node, node.content);
+      expect(text).toContain('Class: User');
+      expect(text).toContain('Methods:');
+      expect(text).toContain('greet');
+      expect(text).toContain('validate');
+      expect(text).toContain('Properties:');
+      expect(text).toContain('name');
+    });
+
+    it('extracts struct fields from Rust', () => {
+      const node: EmbeddableNode = {
+        id: 'Struct:src/user.rs:User',
+        name: 'User',
+        label: 'Struct',
+        filePath: 'src/models/user.rs',
+        content: `struct User {
+    name: String,
+    age: u32,
+}`,
+      };
+      const text = generateEmbeddingText(node, node.content);
+      expect(text).toContain('Struct: User');
+    });
+
+    it('falls back to JS/TS regex for unknown extension', () => {
+      const node: EmbeddableNode = {
+        ...baseNode,
+        label: 'Class',
+        name: 'Parser',
+        filePath: 'src/parser.unknown',
+        content: `class Parser {
+  parse(input) { }
+  validate() { }
+}`,
+      };
+      const text = generateEmbeddingText(node, node.content);
+      expect(text).toContain('Class: Parser');
+      expect(text).toContain('parse');
+      expect(text).toContain('validate');
+    });
+  });
+
   describe('truncateDescription', () => {
     it('returns short text unchanged', () => {
       expect(truncateDescription('short text', 150)).toBe('short text');
