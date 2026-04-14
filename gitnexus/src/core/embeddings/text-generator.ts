@@ -90,24 +90,7 @@ const buildMetadataHeader = (node: EmbeddableNode, config: Partial<EmbeddingConf
   return parts.join('\n');
 };
 
-/**
- * Generate embedding text for Function/Method nodes
- * Includes metadata header + code body (chunk text passed separately)
- */
-const generateFunctionText = (
-  node: EmbeddableNode,
-  codeBody: string,
-  config: Partial<EmbeddingConfig>,
-): string => {
-  const header = buildMetadataHeader(node, config);
-  const cleaned = cleanContent(codeBody);
-  return `${header}\n\n${cleaned}`;
-};
-
-/**
- * Generate embedding text for Constructor nodes
- */
-const generateConstructorText = (
+const generateCodeBodyText = (
   node: EmbeddableNode,
   codeBody: string,
   config: Partial<EmbeddingConfig>,
@@ -187,9 +170,9 @@ const generateClassText = (
   return parts.join('\n');
 };
 
-/**
- * Extract class/interface/struct declaration lines (no method bodies)
- */
+const DECL_START_RE =
+  /^(?:(?:export|pub|data|abstract)\s+)*(?:type\s+\w+\s+struct|(?:class|struct|enum|interface)\s)/;
+
 const extractDeclarationOnly = (content: string): string => {
   const lines = content.split('\n');
   const declLines: string[] = [];
@@ -198,20 +181,14 @@ const extractDeclarationOnly = (content: string): string => {
 
   for (const line of lines) {
     const trimmed = line.trim();
-    if (
-      !started &&
-      (trimmed.match(/^(?:export\s+)?(?:abstract\s+)?(?:data\s+)?class\s/) ||
-        trimmed.match(/^(?:pub\s+)?struct\s/) ||
-        trimmed.match(/^(?:pub\s+)?enum\s/) ||
-        trimmed.match(/^type\s+\w+\s+struct/) ||
-        trimmed.match(/^class\s/) ||
-        trimmed.match(/^interface\s/))
-    ) {
+    if (!started && DECL_START_RE.test(trimmed)) {
       started = true;
     }
     if (started) {
-      depth += (trimmed.match(/\{/g) || []).length;
-      depth -= (trimmed.match(/\}/g) || []).length;
+      for (const ch of trimmed) {
+        if (ch === '{') depth++;
+        else if (ch === '}') depth--;
+      }
       declLines.push(trimmed);
       if (depth <= 0 && declLines.length > 1) break;
     }
@@ -220,26 +197,9 @@ const extractDeclarationOnly = (content: string): string => {
   return declLines.join('\n').trim();
 };
 
-/**
- * Generate embedding text for short nodes (TypeAlias, Const, etc.)
- * No chunking, just metadata + full content
- */
 const generateShortNodeText = (node: EmbeddableNode, config: Partial<EmbeddingConfig>): string => {
   const header = buildMetadataHeader(node, config);
   const cleaned = cleanContent(node.content);
-  return `${header}\n\n${cleaned}`;
-};
-
-/**
- * Generate embedding text for Interface/Struct/Enum/Trait/etc. (chunkable but non-function)
- */
-const generateChunkableNonFunctionText = (
-  node: EmbeddableNode,
-  codeBody: string,
-  config: Partial<EmbeddingConfig>,
-): string => {
-  const header = buildMetadataHeader(node, config);
-  const cleaned = cleanContent(codeBody);
   return `${header}\n\n${cleaned}`;
 };
 
@@ -260,16 +220,7 @@ export const generateEmbeddingText = (
     return generateClassText(node, codeBody, config);
   }
 
-  if (node.label === 'Constructor') {
-    return generateConstructorText(node, codeBody, config);
-  }
-
-  if (node.label === 'Function' || node.label === 'Method') {
-    return generateFunctionText(node, codeBody, config);
-  }
-
-  // Other chunkable types (Interface, Struct, Enum, Trait, Impl, Macro, Namespace)
-  return generateChunkableNonFunctionText(node, codeBody, config);
+  return generateCodeBodyText(node, codeBody, config);
 };
 
 /**

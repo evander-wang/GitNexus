@@ -14,8 +14,7 @@ export { type Chunk, characterChunk } from './character-chunk.js';
 import { characterChunk } from './character-chunk.js';
 import type { Chunk } from './character-chunk.js';
 
-// Module-level parser cache — safe because Parser is stateless
-// and language grammars are read-only
+// Module-level parser cache — safe because Parser is stateless and language grammars are read-only
 let parserInstance: any = null;
 const loadedLanguages = new Set<string>();
 
