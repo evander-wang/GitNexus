@@ -6,6 +6,7 @@
 import { Command } from 'commander';
 import { createRequire } from 'node:module';
 import { createLazyAction } from './lazy-action.js';
+import { registerGroupCommands } from './group.js';
 
 const _require = createRequire(import.meta.url);
 const pkg = _require('../../package.json');
@@ -25,6 +26,7 @@ program
   .option('--embeddings', 'Enable embedding generation for semantic search (off by default)')
   .option('--skills', 'Generate repo-specific skill files from detected communities')
   .option('--skip-agents-md', 'Skip updating the gitnexus section in AGENTS.md and CLAUDE.md')
+  .option('--no-stats', 'Omit volatile file/symbol counts from AGENTS.md and CLAUDE.md')
   .option('--skip-git', 'Index a folder without requiring a .git directory')
   .option('-v, --verbose', 'Enable verbose ingestion warnings (default: false)')
   .addHelpText(
@@ -147,5 +149,7 @@ program
   .option('-p, --port <port>', 'Port number', '4848')
   .option('--idle-timeout <seconds>', 'Auto-shutdown after N seconds idle (0 = disabled)', '0')
   .action(createLazyAction(() => import('./eval-server.js'), 'evalServerCommand'));
+
+registerGroupCommands(program);
 
 program.parse(process.argv);

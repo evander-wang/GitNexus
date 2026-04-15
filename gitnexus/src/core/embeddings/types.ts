@@ -187,6 +187,7 @@ export interface CachedEmbedding {
   startLine: number;
   endLine: number;
   embedding: number[];
+  contentHash?: string;
 }
 
 /**

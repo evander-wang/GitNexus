@@ -5,20 +5,25 @@
  * LanguageProvider, following the Strategy pattern used by the pipeline.
  *
  * Key Swift traits:
- *   - importSemantics: 'wildcard' (Swift imports entire modules)
+ *   - importSemantics: 'wildcard-leaf' (Swift imports entire modules)
  *   - heritageDefaultEdge: 'IMPLEMENTS' (protocols are more common than class inheritance)
  *   - implicitImportWirer: all files in the same SPM target see each other
  */
 
 import { SupportedLanguages } from 'gitnexus-shared';
+import type { NodeLabel } from 'gitnexus-shared';
+import { createClassExtractor } from '../class-extractors/generic.js';
 import { defineLanguage } from '../language-provider.js';
 import { typeConfig as swiftConfig } from '../type-extractors/swift.js';
 import { swiftExportChecker } from '../export-detection.js';
 import { resolveSwiftImport } from '../import-resolvers/swift.js';
 import { SWIFT_QUERIES } from '../tree-sitter-queries.js';
 import type { SwiftPackageConfig } from '../language-config.js';
+import type { SyntaxNode } from '../utils/ast-helpers.js';
 import { createFieldExtractor } from '../field-extractors/generic.js';
 import { swiftConfig as swiftFieldConfig } from '../field-extractors/configs/swift.js';
+import { createMethodExtractor } from '../method-extractors/generic.js';
+import { swiftMethodConfig } from '../method-extractors/configs/swift.js';
 
 /**
  * Group Swift files by SPM target for implicit module visibility.
@@ -106,6 +111,15 @@ function wireSwiftImplicitImports(
     }
   }
 }
+
+/** Swift init/deinit declarations have special names and Constructor label. */
+const swiftExtractFunctionName = (
+  node: SyntaxNode,
+): { funcName: string | null; label: NodeLabel } | null => {
+  if (node.type === 'init_declaration') return { funcName: 'init', label: 'Constructor' };
+  if (node.type === 'deinit_declaration') return { funcName: 'deinit', label: 'Constructor' };
+  return null; // fall through to generic
+};
 
 const BUILT_INS: ReadonlySet<string> = new Set([
   'print',
@@ -224,9 +238,25 @@ export const swiftProvider = defineLanguage({
   typeConfig: swiftConfig,
   exportChecker: swiftExportChecker,
   importResolver: resolveSwiftImport,
-  importSemantics: 'wildcard',
+  importSemantics: 'wildcard-leaf',
   heritageDefaultEdge: 'IMPLEMENTS',
   fieldExtractor: createFieldExtractor(swiftFieldConfig),
+  methodExtractor: createMethodExtractor({
+    ...swiftMethodConfig,
+    extractFunctionName: swiftExtractFunctionName,
+  }),
+  classExtractor: createClassExtractor({
+    language: SupportedLanguages.Swift,
+    typeDeclarationNodes: ['class_declaration', 'protocol_declaration'],
+    ancestorScopeNodeTypes: ['class_declaration', 'protocol_declaration'],
+    extractType(node) {
+      if (node.type === 'protocol_declaration') return 'Interface';
+      if (node.type !== 'class_declaration') return undefined;
+      if (node.children.some((child) => child?.text === 'struct')) return 'Struct';
+      if (node.children.some((child) => child?.text === 'enum')) return 'Enum';
+      return 'Class';
+    },
+  }),
   implicitImportWirer: wireSwiftImplicitImports,
   builtInNames: BUILT_INS,
 });

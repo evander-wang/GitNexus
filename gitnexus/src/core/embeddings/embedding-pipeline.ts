@@ -9,6 +9,7 @@
  * 5. Create vector index for semantic search
  */
 
+import { createHash } from 'crypto';
 import {
   initEmbedder,
   embedBatch,
@@ -32,8 +33,29 @@ import {
   LABELS_WITH_EXPORTED,
   STRUCTURAL_LABELS,
 } from './types.js';
+import {
+  EMBEDDING_TABLE_NAME,
+  EMBEDDING_INDEX_NAME,
+  CREATE_VECTOR_INDEX_QUERY,
+  STALE_HASH_SENTINEL,
+} from '../lbug/schema.js';
+import { loadVectorExtension } from '../lbug/lbug-adapter.js';
 
 const isDev = process.env.NODE_ENV === 'development';
+
+/**
+ * Compute a stable content fingerprint for an embeddable node.
+ * Used to detect when the underlying text has changed so stale vectors
+ * can be replaced (DELETE-then-INSERT, the Kuzu-sanctioned pattern for
+ * vector-indexed rows).
+ */
+export const contentHashForNode = (
+  node: EmbeddableNode,
+  config: Partial<EmbeddingConfig> = {},
+): string => {
+  const text = generateEmbeddingText(node, node.content, config);
+  return createHash('sha1').update(text).digest('hex');
+};
 
 /**
  * Progress callback type
@@ -127,9 +149,10 @@ export const batchInsertEmbeddings = async (
     startLine: number;
     endLine: number;
     embedding: number[];
+    contentHash?: string;
   }>,
 ): Promise<void> => {
-  const cypher = `CREATE (e:CodeEmbedding {id: $id, nodeId: $nodeId, chunkIndex: $chunkIndex, startLine: $startLine, endLine: $endLine, embedding: $embedding})`;
+  const cypher = `CREATE (e:${EMBEDDING_TABLE_NAME} {id: $id, nodeId: $nodeId, chunkIndex: $chunkIndex, startLine: $startLine, endLine: $endLine, embedding: $embedding, contentHash: $contentHash})`;
   const paramsList = updates.map((u) => ({
     id: `${u.nodeId}:${u.chunkIndex}`,
     nodeId: u.nodeId,
@@ -137,34 +160,27 @@ export const batchInsertEmbeddings = async (
     startLine: u.startLine,
     endLine: u.endLine,
     embedding: u.embedding,
+    contentHash: u.contentHash ?? STALE_HASH_SENTINEL,
   }));
   await executeWithReusedStatement(cypher, paramsList);
 };
 
 /**
  * Create the vector index for semantic search
- */
-let vectorExtensionLoaded = false;
 
+ * Now indexes the separate CodeEmbedding table.
+ * Delegates extension loading to lbug-adapter's loadVectorExtension(),
+ * which owns the VECTOR extension lifecycle and state tracking.
+
+ */
 const createVectorIndex = async (
   executeQuery: (cypher: string) => Promise<any[]>,
 ): Promise<void> => {
-  if (!vectorExtensionLoaded) {
-    try {
-      await executeQuery('INSTALL VECTOR');
-      await executeQuery('LOAD EXTENSION VECTOR');
-      vectorExtensionLoaded = true;
-    } catch {
-      vectorExtensionLoaded = true;
-    }
-  }
-
-  const cypher = `
-    CALL CREATE_VECTOR_INDEX('CodeEmbedding', 'code_embedding_idx', 'embedding', metric := 'cosine')
-  `;
+  // Delegate to the adapter which tracks loaded state and handles DB reconnect resets
+  await loadVectorExtension();
 
   try {
-    await executeQuery(cypher);
+    await executeQuery(CREATE_VECTOR_INDEX_QUERY);
   } catch (error) {
     if (isDev) {
       console.warn('Vector index creation warning:', error);
@@ -181,6 +197,10 @@ const createVectorIndex = async (
  * @param config - Optional configuration override
  * @param skipNodeIds - Optional set of node IDs that already have embeddings (incremental mode)
  * @param context - Optional repo/server context for metadata enrichment
+ * @param existingEmbeddings - Optional map of nodeId → contentHash for incremental mode.
+ *        Nodes whose hash matches are skipped; nodes with a changed hash are DELETE'd
+ *        and re-embedded; nodes not in the map are embedded fresh.
+
  */
 export const runEmbeddingPipeline = async (
   executeQuery: (cypher: string) => Promise<any[]>,
@@ -192,6 +212,7 @@ export const runEmbeddingPipeline = async (
   config: Partial<EmbeddingConfig> = {},
   skipNodeIds?: Set<string>,
   context?: EmbeddingContext,
+  existingEmbeddings?: Map<string, string>,
 ): Promise<void> => {
   const finalConfig = { ...DEFAULT_EMBEDDING_CONFIG, ...config };
 
@@ -235,13 +256,57 @@ export const runEmbeddingPipeline = async (
       }
     }
 
-    // Incremental mode: filter out nodes that already have embeddings
-    if (skipNodeIds && skipNodeIds.size > 0) {
+    // Incremental mode: compare content hashes, delete stale rows, skip fresh ones.
+    // Computed hashes for stale nodes are cached so batchInsertEmbeddings can reuse them
+    // (avoids double computation).
+    const computedStaleHashes = new Map<string, string>();
+    if (existingEmbeddings && existingEmbeddings.size > 0) {
       const beforeCount = nodes.length;
-      nodes = nodes.filter((n) => !skipNodeIds.has(n.id));
+      const staleNodeIds: string[] = [];
+      nodes = nodes.filter((n) => {
+        const existingHash = existingEmbeddings.get(n.id);
+        if (existingHash === undefined) {
+          // New node — needs embedding
+          return true;
+        }
+        const currentHash = contentHashForNode(n, finalConfig);
+        if (currentHash !== existingHash) {
+          // Content changed — cache hash for reuse during insert, mark for DELETE + re-embed
+          computedStaleHashes.set(n.id, currentHash);
+          staleNodeIds.push(n.id);
+          return true;
+        }
+        // Hash matches — skip (fresh); no need to cache hash for skipped nodes
+        return false;
+      });
+
+      // DELETE stale embedding rows so they can be re-inserted
+      // (Kuzu forbids SET on vector-indexed properties; DELETE-then-INSERT is the sanctioned pattern)
+      if (staleNodeIds.length > 0) {
+        if (isDev) {
+          console.log(`🔄 Deleting ${staleNodeIds.length} stale embedding rows for re-embed`);
+        }
+        try {
+          await executeWithReusedStatement(
+            `MATCH (e:${EMBEDDING_TABLE_NAME} {nodeId: $nodeId}) DELETE e`,
+            staleNodeIds.map((nodeId) => ({ nodeId })),
+          );
+        } catch (err) {
+          // "does not exist" = rows already gone — safe to proceed.
+          // All other errors risk vector-index corruption (Kuzu requires DELETE-before-INSERT
+          // for vector-indexed properties) — propagate so the pipeline aborts cleanly.
+          const msg = err instanceof Error ? err.message : String(err);
+          if (!msg.includes('does not exist')) {
+            throw new Error(
+              `[embed] Failed to delete stale embedding rows — aborting to prevent vector-index corruption: ${msg}`,
+            );
+          }
+        }
+      }
+
       if (isDev) {
         console.log(
-          `📦 Incremental embeddings: ${beforeCount} total, ${skipNodeIds.size} cached, ${nodes.length} to embed`,
+          `📦 Incremental embeddings: ${beforeCount} total, ${existingEmbeddings.size} cached, ${staleNodeIds.length} stale, ${nodes.length} to embed`,
         );
       }
     }
@@ -253,6 +318,11 @@ export const runEmbeddingPipeline = async (
     }
 
     if (totalNodes === 0) {
+      // Ensure the vector index exists even when no new nodes need embedding.
+      // A prior crash or first-time incremental run may have left CodeEmbedding
+      // rows without ever reaching index creation.
+      await createVectorIndex(executeQuery);
+
       onProgress({
         phase: 'ready',
         percent: 100,
@@ -445,7 +515,8 @@ export const semanticSearch = async (
 
   // Query vector index — get nodeId, chunkIndex, distance
   const vectorQuery = `
-    CALL QUERY_VECTOR_INDEX('CodeEmbedding', 'code_embedding_idx',
+    CALL QUERY_VECTOR_INDEX('${EMBEDDING_TABLE_NAME}', '${EMBEDDING_INDEX_NAME}', 
+
       CAST(${queryVecStr} AS FLOAT[${queryVec.length}]), ${k})
     YIELD node AS emb, distance
     WITH emb, distance

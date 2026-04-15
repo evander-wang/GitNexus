@@ -9,9 +9,10 @@
  * so adding a language to the enum without creating a provider is a compiler error.
  */
 
-import type { SupportedLanguages } from 'gitnexus-shared';
+import type { SupportedLanguages, MroStrategy } from 'gitnexus-shared';
 import type { LanguageTypeConfig } from './type-extractors/types.js';
 import type { CallRouter } from './call-routing.js';
+import type { ClassExtractor } from './class-types.js';
 import type { ExportChecker } from './export-detection.js';
 import type { FieldExtractor } from './field-extractor.js';
 import type { MethodExtractor } from './method-types.js';
@@ -25,15 +26,34 @@ import type { NodeLabel } from 'gitnexus-shared';
 export type CaptureMap = Record<string, SyntaxNode | undefined>;
 
 // ── Strategy tag types ─────────────────────────────────────────────────────
-/** MRO strategy for multiple inheritance resolution. */
-export type MroStrategy =
-  | 'first-wins'
-  | 'c3'
-  | 'leftmost-base'
-  | 'implements-split'
-  | 'qualified-syntax';
-/** How a language handles imports — determines wildcard synthesis behavior. */
-export type ImportSemantics = 'named' | 'wildcard' | 'namespace';
+// NOTE: `MroStrategy` is defined in `gitnexus-shared` and re-exported above
+// so `core/ingestion/model/resolve.ts` can consume it without importing from
+// this file (which would pull in the full language-registry dependency graph).
+
+/**
+ * How a language handles imports — determines wildcard synthesis behavior.
+ *
+ * Import resolution is a graph-traversal policy with multiple distinct strategies,
+ * analogous to MRO for method resolution. Each tag picks a strategy:
+ *
+ * | Tag                   | Mechanism                                      | Traversal           | Languages                                  |
+ * |-----------------------|------------------------------------------------|---------------------|--------------------------------------------|
+ * | `named`               | Per-symbol imports                             | None (use-site)     | JS/TS, Java, C#, Rust, PHP, Kotlin, Vue    |
+ * | `wildcard-transitive` | Textual paste, symbols chain through files     | BFS closure         | C, C++ (future: Obj-C, Fortran, Nim)       |
+ * | `wildcard-leaf`       | Whole public API, single hop                   | None (direct only)  | Go, Ruby, Swift, Dart                      |
+ * | `namespace`           | Qualified handle; symbols resolved at call site| None at import      | Python                                     |
+ * | `explicit-reexport`   | Opt-in per-symbol re-export (SCAFFOLD)         | Topological DAG     | (future: TS `export *`, Rust `pub use`)    |
+ *
+ * The `explicit-reexport` tag is a compile-time scaffold; no provider claims it yet.
+ * It falls through to `wildcard-leaf` behavior in synthesis so today's TS/Rust
+ * handling is unchanged. A future PR will implement the DAG walk for `export *`.
+ */
+export type ImportSemantics =
+  | 'named'
+  | 'wildcard-transitive'
+  | 'wildcard-leaf'
+  | 'namespace'
+  | 'explicit-reexport';
 
 /**
  * Everything a language needs to provide.
@@ -70,10 +90,12 @@ interface LanguageProviderConfig {
   /** Named binding extraction from import statements.
    *  Default: undefined (language uses wildcard/whole-module imports). */
   readonly namedBindingExtractor?: NamedBindingExtractorFn;
-  /** How this language handles imports.
+  /** How this language handles imports. See `ImportSemantics` for the full taxonomy.
    *  - 'named': per-symbol imports (JS/TS, Java, C#, Rust, PHP, Kotlin)
-   *  - 'wildcard': whole-module imports, needs synthesis (Go, Ruby, C/C++, Swift)
-   *  - 'namespace': namespace imports, needs moduleAliasMap (Python)
+   *  - 'wildcard-transitive': textual-include closure; imports chain through files (C, C++)
+   *  - 'wildcard-leaf': whole-module single-hop imports; no transitive chaining (Go, Ruby, Swift, Dart)
+   *  - 'namespace': qualified namespace imports, needs moduleAliasMap (Python)
+   *  - 'explicit-reexport': opt-in per-symbol re-export (scaffold; no provider uses yet)
    *  Default: 'named'. */
   readonly importSemantics?: ImportSemantics;
   /** Language-specific transformation of raw import path text before resolution.
@@ -90,6 +112,16 @@ interface LanguageProviderConfig {
     addImportEdge: (src: string, target: string) => void,
     projectConfig: unknown,
   ) => void;
+
+  // ── Enclosing owner resolution ─────────────────────────────────
+  /** Resolve a container node during enclosing-owner tree walks.
+   *  Called when a CLASS_CONTAINER_TYPES node is found while walking up.
+   *  - Return a different SyntaxNode to remap the container (e.g., Ruby
+   *    singleton_class → enclosing class/module).
+   *  - Return null to skip this container and keep walking up.
+   *  - Omit (undefined) to use the container node as-is (default).
+   *  Default: undefined (no remapping). */
+  readonly resolveEnclosingOwner?: (node: SyntaxNode) => SyntaxNode | null;
 
   // ── Enclosing function resolution ───────────────────────────────
   /** Resolve the enclosing function name + label from an AST ancestor node
@@ -131,6 +163,10 @@ interface LanguageProviderConfig {
    *  declarations. Produces MethodInfo[] with name, parameters, visibility, isAbstract,
    *  isFinal, annotations metadata. Default: undefined (no method extraction). */
   readonly methodExtractor?: MethodExtractor;
+  /** Class/type extractor for deriving canonical qualified names for class-like symbols.
+   *  Uses the same provider-driven strategy pattern as method/field extraction so
+   *  namespace/package/module rules stay language-specific. */
+  readonly classExtractor?: ClassExtractor;
   /** Extract a semantic description for a definition node (e.g., PHP Eloquent
    *  property arrays, relation method descriptions).
    *  Default: undefined (no description extraction). */

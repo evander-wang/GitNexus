@@ -26,6 +26,7 @@ interface RepoStats {
 
 export interface AIContextOptions {
   skipAgentsMd?: boolean;
+  noStats?: boolean;
 }
 
 const GITNEXUS_START_MARKER = '<!-- gitnexus:start -->';
@@ -42,10 +43,29 @@ const GITNEXUS_END_MARKER = '<!-- gitnexus:end -->';
  * - Exact tool commands with parameters — vague directives get ignored
  * - Self-review checklist — forces model to verify its own work
  */
+async function findGroupsContainingRegistryName(registryName: string): Promise<string[]> {
+  const { listGroups, getDefaultGitnexusDir, getGroupDir } =
+    await import('../core/group/storage.js');
+  const { loadGroupConfig } = await import('../core/group/config-parser.js');
+  const names = await listGroups();
+  const hits: string[] = [];
+  for (const g of names) {
+    try {
+      const config = await loadGroupConfig(getGroupDir(getDefaultGitnexusDir(), g));
+      if (Object.values(config.repos).some((r) => r === registryName)) hits.push(config.name);
+    } catch {
+      // skip invalid or unreadable groups
+    }
+  }
+  return hits;
+}
+
 function generateGitNexusContent(
   projectName: string,
   stats: RepoStats,
   generatedSkills?: GeneratedSkillInfo[],
+  groupNames?: string[],
+  noStats?: boolean,
 ): string {
   const generatedRows =
     generatedSkills && generatedSkills.length > 0
@@ -69,7 +89,7 @@ function generateGitNexusContent(
   return `${GITNEXUS_START_MARKER}
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **${projectName}** (${stats.nodes || 0} symbols, ${stats.edges || 0} relationships, ${stats.processes || 0} execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **${projectName}**${noStats ? '' : ` (${stats.nodes || 0} symbols, ${stats.edges || 0} relationships, ${stats.processes || 0} execution flows)`}. Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > If any GitNexus tool warns the index is stale, run \`npx gitnexus analyze\` in terminal first.
 
@@ -155,7 +175,15 @@ To check whether embeddings exist, inspect \`.gitnexus/meta.json\` — the \`sta
 
 > Claude Code users: A PostToolUse hook handles this automatically after \`git commit\` and \`git merge\`.
 
-## CLI
+${
+  groupNames && groupNames.length > 0
+    ? `## Cross-Repo Groups
+
+This repository is listed under GitNexus **group(s): ${groupNames.join(', ')}** (see \`~/.gitnexus/groups/\`). For blast radius across repository boundaries, use MCP tools \`group_impact\`, \`group_sync\`, \`group_query\`, \`group_contracts\`, \`group_status\`, and \`group_list\`. From the terminal: \`npx gitnexus group list\`, \`npx gitnexus group sync <name>\`, \`npx gitnexus group impact <name> --target <symbol> --repo <group-path>\`.
+
+`
+    : ''
+}## CLI
 
 ${skillsTable}
 
@@ -305,7 +333,14 @@ export async function generateAIContextFiles(
   generatedSkills?: GeneratedSkillInfo[],
   options?: AIContextOptions,
 ): Promise<{ files: string[] }> {
-  const content = generateGitNexusContent(projectName, stats, generatedSkills);
+  const groupNames = await findGroupsContainingRegistryName(projectName);
+  const content = generateGitNexusContent(
+    projectName,
+    stats,
+    generatedSkills,
+    groupNames,
+    options?.noStats,
+  );
   const createdFiles: string[] = [];
 
   if (!options?.skipAgentsMd) {
