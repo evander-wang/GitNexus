@@ -61,6 +61,16 @@ export const isShortLabel = (label: string): boolean =>
   (SHORT_LABELS as readonly string[]).includes(label);
 
 /**
+ * Node labels that have structural names (methods/fields) extractable via AST
+ */
+export const STRUCTURAL_LABELS: ReadonlySet<string> = new Set([
+  'Class',
+  'Struct',
+  'Interface',
+  'Enum',
+]);
+
+/**
  * Node labels that have isExported column in their schema
  */
 export const LABELS_WITH_EXPORTED = new Set([
@@ -164,6 +174,8 @@ export interface EmbeddableNode {
   returnType?: string;
   repoName?: string;
   serverName?: string;
+  methodNames?: string[];
+  fieldNames?: string[];
 }
 
 /**

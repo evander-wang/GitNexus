@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   generateEmbeddingText,
   truncateDescription,
+  extractDeclarationOnly,
 } from '../../src/core/embeddings/text-generator.js';
 import { isChunkableLabel } from '../../src/core/embeddings/types.js';
 import type { EmbeddableNode } from '../../src/core/embeddings/types.js';
@@ -68,11 +69,13 @@ describe('text-generator', () => {
       expect(text).toContain('type Result<T> = Success<T> | Error;');
     });
 
-    it('generates Class text with method names', () => {
+    it('generates Class text with AST-extracted method/field names', () => {
       const node: EmbeddableNode = {
         ...baseNode,
         label: 'Class',
         name: 'Parser',
+        methodNames: ['parseJSON', 'validate'],
+        fieldNames: ['options', 'cache'],
         content: `class Parser {
   options: ParserOptions;
   private cache: Map<string, any>;
@@ -82,11 +85,25 @@ describe('text-generator', () => {
       };
       const text = generateEmbeddingText(node, node.content);
       expect(text).toContain('Class: Parser');
-      expect(text).toContain('Methods:');
-      expect(text).toContain('parseJSON');
-      expect(text).toContain('validate');
-      expect(text).toContain('Properties:');
-      expect(text).toContain('options');
+      expect(text).toContain('Methods: parseJSON, validate');
+      expect(text).toContain('Properties: options, cache');
+      // Method bodies should NOT appear in declaration section
+      expect(text).not.toContain('return JSON.parse');
+      expect(text).not.toContain('return true');
+    });
+
+    it('generates Class text without method names when not provided', () => {
+      const node: EmbeddableNode = {
+        ...baseNode,
+        label: 'Class',
+        name: 'Parser',
+        content: `class Parser {
+  parse(input) { }
+}`,
+      };
+      const text = generateEmbeddingText(node, node.content);
+      expect(text).toContain('Class: Parser');
+      expect(text).not.toContain('Methods:');
     });
   });
 
@@ -108,77 +125,60 @@ describe('text-generator', () => {
     });
   });
 
-  describe('multi-language class text', () => {
-    it('extracts methods from Python class', () => {
-      const node: EmbeddableNode = {
-        id: 'Class:src/models.py:User',
-        name: 'User',
-        label: 'Class',
-        filePath: 'src/models/user.py',
-        content: `class User:
+  describe('extractDeclarationOnly', () => {
+    it('strips method bodies from TS class', () => {
+      const content = `class Foo {
+  prop1: string;
+  method1() {
+    if (x) { nested }
+  }
+  method2() { return 1; }
+}`;
+      const result = extractDeclarationOnly(content);
+      expect(result).toContain('class Foo {');
+      expect(result).toContain('prop1: string;');
+      expect(result).not.toContain('if (x)');
+      expect(result).not.toContain('return 1');
+    });
+
+    it('keeps single-line methods with semicolon (property initializers)', () => {
+      const content = `class Foo {
+  config = { timeout: 5000 };
+  count = 0;
+}`;
+      const result = extractDeclarationOnly(content);
+      expect(result).toContain('config = { timeout: 5000 };');
+      expect(result).toContain('count = 0;');
+    });
+
+    it('returns empty for non-brace languages (Python)', () => {
+      const content = `class User:
     def __init__(self, name):
-        self.name = name
-
-    def get_full_name(self):
-        return self.name`,
-      };
-      const text = generateEmbeddingText(node, node.content);
-      expect(text).toContain('Class: User');
-      expect(text).toContain('Methods:');
-      expect(text).toContain('__init__');
-      expect(text).toContain('get_full_name');
+        self.name = name`;
+      const result = extractDeclarationOnly(content);
+      expect(result).toBe('');
     });
 
-    it('extracts methods from Kotlin class', () => {
-      const node: EmbeddableNode = {
-        id: 'Class:User.kt:User',
-        name: 'User',
-        label: 'Class',
-        filePath: 'src/models/User.kt',
-        content: `class User(val name: String) {
-    fun greet(): String = "Hello"
-    private fun validate() { }
-}`,
-      };
-      const text = generateEmbeddingText(node, node.content);
-      expect(text).toContain('Class: User');
-      expect(text).toContain('Methods:');
-      expect(text).toContain('greet');
-      expect(text).toContain('validate');
-      expect(text).toContain('Properties:');
-      expect(text).toContain('name');
-    });
-
-    it('extracts struct fields from Rust', () => {
-      const node: EmbeddableNode = {
-        id: 'Struct:src/user.rs:User',
-        name: 'User',
-        label: 'Struct',
-        filePath: 'src/models/user.rs',
-        content: `struct User {
+    it('preserves all fields in Rust struct', () => {
+      const content = `struct User {
     name: String,
     age: u32,
-}`,
-      };
-      const text = generateEmbeddingText(node, node.content);
-      expect(text).toContain('Struct: User');
+}`;
+      const result = extractDeclarationOnly(content);
+      expect(result).toContain('struct User {');
+      expect(result).toContain('name: String,');
+      expect(result).toContain('age: u32,');
     });
 
-    it('falls back to JS/TS regex for unknown extension', () => {
-      const node: EmbeddableNode = {
-        ...baseNode,
-        label: 'Class',
-        name: 'Parser',
-        filePath: 'src/parser.unknown',
-        content: `class Parser {
-  parse(input) { }
-  validate() { }
-}`,
-      };
-      const text = generateEmbeddingText(node, node.content);
-      expect(text).toContain('Class: Parser');
-      expect(text).toContain('parse');
-      expect(text).toContain('validate');
+    it('preserves all lines in interface (no method bodies)', () => {
+      const content = `interface Handler {
+  handle(event: Event): void;
+  validate(input: string): boolean;
+}`;
+      const result = extractDeclarationOnly(content);
+      expect(result).toContain('interface Handler {');
+      expect(result).toContain('handle(event: Event): void;');
+      expect(result).toContain('validate(input: string): boolean;');
     });
   });
 

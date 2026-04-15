@@ -18,6 +18,7 @@ import {
 } from './embedder.js';
 import { generateEmbeddingText } from './text-generator.js';
 import { chunkNode, characterChunk } from './chunker.js';
+import { extractStructuralNames } from './structural-extractor.js';
 import {
   type EmbeddingProgress,
   type EmbeddingConfig,
@@ -29,6 +30,7 @@ import {
   EMBEDDABLE_LABELS,
   isShortLabel,
   LABELS_WITH_EXPORTED,
+  STRUCTURAL_LABELS,
 } from './types.js';
 
 const isDev = process.env.NODE_ENV === 'development';
@@ -293,6 +295,17 @@ export const runEmbeddingPipeline = async (
         const isShort = isShortLabel(node.label);
         const startLine = node.startLine ?? 0;
         const endLine = node.endLine ?? 0;
+
+        // Extract structural names for class-like nodes via AST extractors
+        if (!isShort && STRUCTURAL_LABELS.has(node.label)) {
+          try {
+            const names = await extractStructuralNames(node.content, node.filePath);
+            node.methodNames = names.methodNames;
+            node.fieldNames = names.fieldNames;
+          } catch {
+            // AST extraction failed — names stay undefined, text-generator handles gracefully
+          }
+        }
 
         let chunks: Array<{ text: string; chunkIndex: number; startLine: number; endLine: number }>;
         if (isShort) {

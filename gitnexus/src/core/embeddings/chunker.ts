@@ -7,16 +7,11 @@
  * - Short content (≤ chunkSize): no chunking
  */
 
-import { getLanguageFromFilename } from 'gitnexus-shared';
-
 export { type Chunk, characterChunk } from './character-chunk.js';
 
 import { characterChunk } from './character-chunk.js';
 import type { Chunk } from './character-chunk.js';
-
-// Module-level parser cache — safe because Parser is stateless and language grammars are read-only
-let parserInstance: any = null;
-const loadedLanguages = new Set<string>();
+import { ensureAndParse, findNodeByRange } from './ast-utils.js';
 
 /**
  * Main chunkNode function: dispatches by label
@@ -61,24 +56,9 @@ const astChunk = async (
   chunkSize: number,
   overlap: number,
 ): Promise<Chunk[]> => {
-  const language = getLanguageFromFilename(filePath);
-  if (!language) return [];
+  const tree = await ensureAndParse(content, filePath);
+  if (!tree) return [];
 
-  const { loadParser, loadLanguage, isLanguageAvailable } =
-    await import('../tree-sitter/parser-loader.js');
-  if (!isLanguageAvailable(language)) return [];
-
-  // Use cached parser — only init once
-  if (!parserInstance) {
-    parserInstance = await loadParser();
-  }
-  // Only load each language once
-  if (!loadedLanguages.has(language)) {
-    await loadLanguage(language, filePath);
-    loadedLanguages.add(language);
-  }
-
-  const tree = parserInstance.parse(content);
   const root = tree.rootNode;
 
   // Find the node matching our startLine/endLine (0-based in tree-sitter)
@@ -154,26 +134,6 @@ const astChunk = async (
   }
 
   return chunks;
-};
-
-/**
- * Find a node in the AST that matches the given line range
- */
-const findNodeByRange = (node: any, startLine: number, endLine: number): any | null => {
-  if (node.startPosition.row === startLine && node.endPosition.row === endLine) {
-    return node;
-  }
-
-  if (node.startPosition.row <= startLine && node.endPosition.row >= endLine) {
-    for (let i = 0; i < node.namedChildCount; i++) {
-      const child = node.namedChild(i);
-      if (!child) continue;
-      const found = findNodeByRange(child, startLine, endLine);
-      if (found) return found;
-    }
-  }
-
-  return null;
 };
 
 /**

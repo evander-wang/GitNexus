@@ -4,12 +4,13 @@
  * Generates enriched embedding text from code nodes with metadata.
  * Supports chunkable labels (Function/Method with AST chunking),
  * Class-specific structural text, and short-node direct embed.
+ *
+ * Method/field names for Class nodes are extracted by the ingestion
+ * pipeline's AST extractors and passed via node.methodNames/node.fieldNames.
  */
 
 import type { EmbeddableNode, EmbeddingConfig } from './types.js';
 import { DEFAULT_EMBEDDING_CONFIG, isShortLabel } from './types.js';
-import { getLanguageFromFilename } from 'gitnexus-shared';
-import { getPatternsForLanguage } from './language-patterns.js';
 
 /**
  * Truncate description to max length at sentence/word boundary
@@ -103,7 +104,7 @@ const generateCodeBodyText = (
 /**
  * Generate embedding text for Class nodes
  * Signature + properties + method name list only (no method bodies)
- * Multi-language: dispatches to language-patterns for method/property extraction.
+ * Method/field names come from AST extractors via node.methodNames/node.fieldNames.
  */
 const generateClassText = (
   node: EmbeddableNode,
@@ -113,55 +114,16 @@ const generateClassText = (
   const header = buildMetadataHeader(node, config);
   const parts: string[] = [header];
 
-  const cleaned = cleanContent(codeBody);
-
-  // Try language-specific patterns first
-  const language = getLanguageFromFilename(node.filePath);
-  const patterns = language ? getPatternsForLanguage(language) : undefined;
-
-  if (patterns) {
-    const methods = patterns.extractMethods(cleaned);
-    const properties = patterns.extractProperties(cleaned);
-    if (methods.length > 0) parts.push(`Methods: ${methods.join(', ')}`);
-    if (properties.length > 0) parts.push(`Properties: ${properties.join(', ')}`);
-  } else {
-    // Fallback: original JS/TS regex
-    const methods: string[] = [];
-    const properties: string[] = [];
-    const lines = cleaned.split('\n');
-    let inClass = false;
-
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (
-        trimmed.match(/^(?:export\s+)?(?:abstract\s+)?class\s/) ||
-        trimmed.startsWith('data class ')
-      ) {
-        inClass = true;
-        continue;
-      }
-      if (!inClass) continue;
-
-      const methodMatch = trimmed.match(
-        /^(?:public|private|protected|static|async|abstract|\s)*\s*(\w+)\s*\(/,
-      );
-      if (methodMatch && !trimmed.startsWith('//') && !trimmed.startsWith('*')) {
-        methods.push(methodMatch[1]);
-      }
-
-      const propMatch = trimmed.match(
-        /^(?:public|private|protected|static|readonly)\s+(\w+)\s*[=:(]/,
-      );
-      if (propMatch) {
-        properties.push(propMatch[1]);
-      }
-    }
-
-    if (methods.length > 0) parts.push(`Methods: ${methods.join(', ')}`);
-    if (properties.length > 0) parts.push(`Properties: ${properties.join(', ')}`);
+  // Use AST-extracted names from ingestion pipeline extractors
+  if (node.methodNames?.length) {
+    parts.push(`Methods: ${node.methodNames.join(', ')}`);
+  }
+  if (node.fieldNames?.length) {
+    parts.push(`Properties: ${node.fieldNames.join(', ')}`);
   }
 
   // Class declaration only (no method bodies)
+  const cleaned = cleanContent(codeBody);
   const declarationOnly = extractDeclarationOnly(cleaned);
   if (declarationOnly) {
     parts.push('', declarationOnly);
@@ -173,34 +135,80 @@ const generateClassText = (
 const DECL_START_RE =
   /^(?:(?:export|pub|data|abstract)\s+)*(?:type\s+\w+\s+struct|(?:class|struct|enum|interface)\s)/;
 
-const extractDeclarationOnly = (content: string): string => {
+/**
+ * Extract class/interface/struct declaration lines, skipping method bodies.
+ * - Brace-based languages: detects method signatures (lines with `(` and `{`)
+ *   and skips until depth returns to class body level.
+ * - Non-brace languages (Python/Ruby): returns empty string (patterns handle extraction).
+ */
+export const extractDeclarationOnly = (content: string): string => {
   const lines = content.split('\n');
   const declLines: string[] = [];
   let depth = 0;
   let started = false;
+  let classDepth = 0;
+  let skipDepth = 0;
 
-  for (const line of lines) {
+  for (const [idx, line] of lines.entries()) {
     const trimmed = line.trim();
-    if (!started && DECL_START_RE.test(trimmed)) {
-      started = true;
-    }
-    if (started) {
-      for (const ch of trimmed) {
-        if (ch === '{') depth++;
-        else if (ch === '}') depth--;
+
+    if (!started) {
+      if (DECL_START_RE.test(trimmed)) {
+        // Non-brace language check: current line or next 3 lines must have `{`
+        const nextLines = lines.slice(idx + 1, idx + 4);
+        if (!trimmed.includes('{') && !nextLines.some((l) => l.includes('{'))) {
+          return '';
+        }
+        started = true;
+        declLines.push(trimmed);
+        for (const ch of trimmed) {
+          if (ch === '{') depth++;
+          else if (ch === '}') depth--;
+        }
+        if (depth > 0) classDepth = depth;
       }
-      declLines.push(trimmed);
-      if (depth <= 0 && declLines.length > 1) break;
+      continue;
     }
+
+    // Always update depth (even when skipping)
+    const opens = (trimmed.match(/{/g) || []).length;
+    const closes = (trimmed.match(/}/g) || []).length;
+    const prevDepth = depth;
+    depth += opens - closes;
+
+    if (skipDepth > 0) {
+      if (depth <= classDepth) {
+        skipDepth = 0;
+        // Closing brace of class
+        if (depth <= 0) {
+          declLines.push(trimmed);
+          break;
+        }
+      }
+      continue;
+    }
+
+    // Detect method signature: line has both `(` and `{` and goes deeper than class body
+    const hasParens = trimmed.includes('(');
+    const hasOpenBrace = opens > 0;
+    if (hasParens && hasOpenBrace && prevDepth + opens > classDepth) {
+      if (opens === closes && trimmed.endsWith(';')) {
+        // Property with function/object initializer like `config = { timeout: 5000 };` — keep
+        declLines.push(trimmed);
+      }
+      // else: single-line or multi-line method — skip entirely
+      if (opens !== closes) {
+        skipDepth = classDepth;
+      }
+      continue;
+    }
+
+    declLines.push(trimmed);
+
+    if (depth <= 0 && declLines.length > 1) break;
   }
 
   return declLines.join('\n').trim();
-};
-
-const generateShortNodeText = (node: EmbeddableNode, config: Partial<EmbeddingConfig>): string => {
-  const header = buildMetadataHeader(node, config);
-  const cleaned = cleanContent(node.content);
-  return `${header}\n\n${cleaned}`;
 };
 
 /**
@@ -213,7 +221,9 @@ export const generateEmbeddingText = (
   config: Partial<EmbeddingConfig> = {},
 ): string => {
   if (isShortLabel(node.label)) {
-    return generateShortNodeText(node, config);
+    const header = buildMetadataHeader(node, config);
+    const cleaned = cleanContent(node.content);
+    return `${header}\n\n${cleaned}`;
   }
 
   if (node.label === 'Class') {
