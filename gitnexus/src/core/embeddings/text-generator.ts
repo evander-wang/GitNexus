@@ -111,10 +111,17 @@ const generateClassText = (
   codeBody: string,
   config: Partial<EmbeddingConfig>,
 ): string => {
+  return generateStructuralTypeText(node, codeBody, config);
+};
+
+const generateStructuralTypeText = (
+  node: EmbeddableNode,
+  codeBody: string,
+  config: Partial<EmbeddingConfig>,
+): string => {
   const header = buildMetadataHeader(node, config);
   const parts: string[] = [header];
 
-  // Use AST-extracted names from ingestion pipeline extractors
   if (node.methodNames?.length) {
     parts.push(`Methods: ${node.methodNames.join(', ')}`);
   }
@@ -122,11 +129,14 @@ const generateClassText = (
     parts.push(`Properties: ${node.fieldNames.join(', ')}`);
   }
 
-  // Class declaration only (no method bodies)
-  const cleaned = cleanContent(codeBody);
-  const declarationOnly = extractDeclarationOnly(cleaned);
+  const declarationOnly = extractDeclarationOnly(cleanContent(node.content));
   if (declarationOnly) {
     parts.push('', declarationOnly);
+  }
+
+  const cleanedChunk = cleanContent(codeBody);
+  if (cleanedChunk && cleanedChunk !== cleanContent(node.content)) {
+    parts.push('', cleanedChunk);
   }
 
   return parts.join('\n');
@@ -228,6 +238,10 @@ export const generateEmbeddingText = (
 
   if (node.label === 'Class') {
     return generateClassText(node, codeBody, config);
+  }
+
+  if (node.label === 'Interface') {
+    return generateStructuralTypeText(node, codeBody, config);
   }
 
   return generateCodeBodyText(node, codeBody, config);

@@ -967,33 +967,43 @@ export const fetchExistingEmbeddingHashes = async (
 ): Promise<Map<string, string> | undefined> => {
   try {
     const rows = await execQuery(
-      `MATCH (e:${EMBEDDING_TABLE_NAME}) RETURN e.nodeId AS nodeId, e.contentHash AS contentHash`,
+      `MATCH (e:${EMBEDDING_TABLE_NAME}) RETURN e.nodeId AS nodeId, e.chunkIndex AS chunkIndex, e.startLine AS startLine, e.endLine AS endLine, e.contentHash AS contentHash`,
     );
     if (!rows || rows.length === 0) return undefined;
     const map = new Map<string, string>();
     for (const r of rows) {
       const nodeId = r.nodeId ?? r[0];
-      const hash = r.contentHash ?? r[1] ?? STALE_HASH_SENTINEL;
+      const chunkIndex = r.chunkIndex ?? r[1];
+      const startLine = r.startLine ?? r[2];
+      const endLine = r.endLine ?? r[3];
+      const hash = r.contentHash ?? r[4] ?? STALE_HASH_SENTINEL;
       if (nodeId) {
-        // Empty/null contentHash means legacy row — treat as stale so it gets re-embedded
-        map.set(nodeId, hash || STALE_HASH_SENTINEL);
+        const hasChunkMetadata =
+          chunkIndex !== undefined &&
+          chunkIndex !== null &&
+          startLine !== undefined &&
+          startLine !== null &&
+          endLine !== undefined &&
+          endLine !== null;
+        // Empty/null contentHash or missing chunk metadata means legacy row — treat as stale.
+        map.set(nodeId, hasChunkMetadata && hash ? hash : STALE_HASH_SENTINEL);
       }
     }
     return map;
   } catch (err: any) {
     const msg = err?.message ?? '';
     if (isMissingColumnOrTableError(msg)) {
-      // Column or table missing — try fallback without contentHash
+      // Legacy rows missing chunk-aware columns — treat every row as stale.
       try {
         const rows = await execQuery(`MATCH (e:${EMBEDDING_TABLE_NAME}) RETURN e.nodeId AS nodeId`);
         if (!rows || rows.length === 0) return undefined;
         const map = new Map<string, string>();
         for (const r of rows) {
           const nodeId = r.nodeId ?? r[0];
-          if (nodeId) map.set(nodeId, STALE_HASH_SENTINEL); // no contentHash — treat as stale
+          if (nodeId) map.set(nodeId, STALE_HASH_SENTINEL);
         }
         console.log(
-          `[embed] ${map.size} nodes in legacy DB (no contentHash) — all treated as stale`,
+          `[embed] ${map.size} nodes in legacy DB (missing chunk-aware columns) — all treated as stale`,
         );
         return map;
       } catch (fallbackErr: any) {

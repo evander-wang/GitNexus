@@ -105,6 +105,49 @@ describe('text-generator', () => {
       expect(text).toContain('Class: Parser');
       expect(text).not.toContain('Methods:');
     });
+
+    it('generates Interface text with structural names and signatures', () => {
+      const node: EmbeddableNode = {
+        ...baseNode,
+        label: 'Interface',
+        name: 'Handler',
+        methodNames: ['handle', 'validate'],
+        fieldNames: ['name'],
+        content: `interface Handler {
+  handle(event: Event): void;
+  validate(input: string): boolean;
+  readonly name: string;
+}`,
+      };
+      const text = generateEmbeddingText(node, node.content);
+      expect(text).toContain('Interface: Handler');
+      expect(text).toContain('Methods: handle, validate');
+      expect(text).toContain('Properties: name');
+      expect(text).toContain('handle(event: Event): void;');
+      expect(text).toContain('readonly name: string;');
+    });
+
+    it('includes chunk body for structural node chunks', () => {
+      const node: EmbeddableNode = {
+        ...baseNode,
+        label: 'Class',
+        name: 'Parser',
+        methodNames: ['parseJSON', 'validate'],
+        fieldNames: ['options', 'cache'],
+        content: `class Parser {
+  options: ParserOptions;
+  cache: Map<string, any>;
+  parseJSON(text: string) { return JSON.parse(text); }
+  validate() { return true; }
+}`,
+      };
+      const chunkBody = `parseJSON(text: string) { return JSON.parse(text); }`;
+      const text = generateEmbeddingText(node, chunkBody);
+      expect(text).toContain('Class: Parser');
+      expect(text).toContain('Methods: parseJSON, validate');
+      expect(text).toContain('class Parser {');
+      expect(text).toContain('parseJSON(text: string) { return JSON.parse(text); }');
+    });
   });
 
   describe('Constructor label', () => {

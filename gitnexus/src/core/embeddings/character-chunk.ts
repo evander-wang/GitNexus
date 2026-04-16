@@ -2,9 +2,13 @@
  * Character-based sliding window chunking (pure, no tree-sitter dependency)
  */
 
+import { buildLineIndex, resolveChunkLines } from './line-index.js';
+
 export interface Chunk {
   text: string;
   chunkIndex: number;
+  startOffset: number;
+  endOffset: number;
   startLine: number;
   endLine: number;
 }
@@ -17,30 +21,34 @@ export const characterChunk = (
   overlap: number = 120,
 ): Chunk[] => {
   if (content.length <= chunkSize) {
-    return [{ text: content, chunkIndex: 0, startLine, endLine }];
+    return [
+      {
+        text: content,
+        chunkIndex: 0,
+        startOffset: 0,
+        endOffset: content.length,
+        startLine,
+        endLine,
+      },
+    ];
   }
 
   const chunks: Chunk[] = [];
   let offset = 0;
-  const lines = content.split('\n');
-
-  // Build cumulative offset lookup for O(1) line estimation
-  const lineOffsets = new Int32Array(lines.length);
-  let acc = 0;
-  for (let i = 0; i < lines.length; i++) {
-    lineOffsets[i] = acc;
-    acc += lines[i].length + 1;
-  }
+  const lineOffsets = buildLineIndex(content);
 
   while (offset < content.length) {
     const end = Math.min(offset + chunkSize, content.length);
     const chunkText = content.slice(offset, end);
+    const lineRange = resolveChunkLines(lineOffsets, offset, end, startLine);
 
     chunks.push({
       text: chunkText,
       chunkIndex: chunks.length,
-      startLine: estimateLineFromOffset(lineOffsets, offset, startLine),
-      endLine: estimateLineFromOffset(lineOffsets, end, startLine),
+      startOffset: offset,
+      endOffset: end,
+      startLine: lineRange.startLine,
+      endLine: lineRange.endLine,
     });
 
     offset = end - overlap;
@@ -52,19 +60,4 @@ export const characterChunk = (
   }
 
   return chunks;
-};
-
-const estimateLineFromOffset = (
-  lineOffsets: Int32Array,
-  charOffset: number,
-  startLine: number,
-): number => {
-  let lo = 0;
-  let hi = lineOffsets.length - 1;
-  while (lo < hi) {
-    const mid = (lo + hi + 1) >> 1;
-    if (lineOffsets[mid] <= charOffset) lo = mid;
-    else hi = mid - 1;
-  }
-  return startLine + lo + 1;
 };

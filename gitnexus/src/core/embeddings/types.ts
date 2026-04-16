@@ -208,3 +208,75 @@ export interface ModelProgress {
   loaded?: number;
   total?: number;
 }
+
+export interface ChunkSearchRow {
+  nodeId: string;
+  chunkIndex: number;
+  startLine: number;
+  endLine: number;
+  distance: number;
+}
+
+export interface BestChunkMatch {
+  chunkIndex: number;
+  startLine: number;
+  endLine: number;
+  distance: number;
+}
+
+/**
+ * Deduplicate vector search chunk results by nodeId,
+ * keeping the chunk with smallest distance for each node.
+ */
+export const dedupBestChunks = (
+  rows: ChunkSearchRow[],
+  limit?: number,
+): Map<string, BestChunkMatch> => {
+  const best = new Map<string, BestChunkMatch>();
+  for (const row of rows) {
+    const existing = best.get(row.nodeId);
+    if (!existing || row.distance < existing.distance) {
+      best.set(row.nodeId, {
+        chunkIndex: row.chunkIndex,
+        startLine: row.startLine,
+        endLine: row.endLine,
+        distance: row.distance,
+      });
+    }
+    if (limit !== undefined && best.size >= limit) break;
+  }
+  return best;
+};
+
+const DEFAULT_FETCH_MULTIPLIER = 4;
+const DEFAULT_FETCH_BUFFER = 8;
+const DEFAULT_MAX_FETCH = 200;
+
+/**
+ * Fetch vector-search chunks until we have enough unique nodeIds
+ * or can tell the result set is exhausted.
+ */
+export const collectBestChunks = async (
+  limit: number,
+  fetchRows: (fetchLimit: number) => Promise<ChunkSearchRow[]>,
+  maxFetch: number = DEFAULT_MAX_FETCH,
+): Promise<Map<string, BestChunkMatch>> => {
+  if (limit <= 0) return new Map();
+
+  let fetchLimit = Math.max(limit * DEFAULT_FETCH_MULTIPLIER, limit + DEFAULT_FETCH_BUFFER);
+  let previousFetchLimit = 0;
+
+  while (fetchLimit > previousFetchLimit) {
+    const rows = await fetchRows(fetchLimit);
+    const bestChunks = dedupBestChunks(rows, limit);
+
+    if (bestChunks.size >= limit || rows.length < fetchLimit) {
+      return bestChunks;
+    }
+
+    previousFetchLimit = fetchLimit;
+    fetchLimit = fetchLimit >= maxFetch ? fetchLimit * 2 : Math.min(maxFetch, fetchLimit * 2);
+  }
+
+  return new Map();
+};

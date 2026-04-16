@@ -5,11 +5,13 @@
  */
 
 import { getLanguageFromFilename } from 'gitnexus-shared';
-import { loadParser, loadLanguage, isLanguageAvailable } from '../tree-sitter/parser-loader.js';
+import {
+  createParserForLanguage,
+  isLanguageAvailable,
+  resolveLanguageKey,
+} from '../tree-sitter/parser-loader.js';
 
-// Module-level parser cache — delegates to parser-loader.ts singletons
-let parserInstance: any = null;
-const loadedLanguages = new Set<string>();
+const parserCache = new Map<string, any>();
 
 /**
  * Ensure parser is initialized and language is loaded, then parse content.
@@ -20,32 +22,56 @@ export const ensureAndParse = async (content: string, filePath: string): Promise
   if (!language) return null;
   if (!isLanguageAvailable(language)) return null;
 
+  const parserKey = resolveLanguageKey(language, filePath);
+  let parserInstance = parserCache.get(parserKey);
   if (!parserInstance) {
-    parserInstance = await loadParser();
-  }
-  if (!loadedLanguages.has(language)) {
-    await loadLanguage(language, filePath);
-    loadedLanguages.add(language);
+    parserInstance = await createParserForLanguage(language, filePath);
+    parserCache.set(parserKey, parserInstance);
   }
 
   return parserInstance.parse(content);
 };
 
-/**
- * Find a node in the AST whose start/end rows match the given range (0-based).
- */
-export const findNodeByRange = (node: any, startLine: number, endLine: number): any | null => {
-  if (node.startPosition.row === startLine && node.endPosition.row === endLine) {
-    return node;
-  }
+const FUNCTION_LIKE_TYPES = new Set([
+  'function_declaration',
+  'function_definition',
+  'method_declaration',
+  'method_definition',
+  'function_item',
+  'function_signature_item',
+  'arrow_function',
+  'function_expression',
+  'generator_function_declaration',
+  'generator_function',
+  'async_function_declaration',
+  'async_arrow_function',
+  'constructor_declaration',
+  'constructor_definition',
+  'compact_constructor_declaration',
+  'short_function_declaration',
+  'proc_declaration',
+  'func_literal',
+  'local_function_statement',
+  'anonymous_function',
+  'lambda_literal',
+  'init_declaration',
+  'deinit_declaration',
+]);
 
-  if (node.startPosition.row <= startLine && node.endPosition.row >= endLine) {
-    for (let i = 0; i < node.namedChildCount; i++) {
-      const child = node.namedChild(i);
-      if (!child) continue;
-      const found = findNodeByRange(child, startLine, endLine);
-      if (found) return found;
-    }
+/**
+ * Find the first function/method-like declaration in a snippet AST.
+ * Used by the chunker when parsing node.content where absolute line
+ * numbers don't apply.
+ */
+export const findFunctionNode = (root: any): any | null => {
+  if (FUNCTION_LIKE_TYPES.has(root.type)) return root;
+
+  for (let i = 0; i < root.namedChildCount; i++) {
+    const child = root.namedChild(i);
+    if (!child) continue;
+    if (FUNCTION_LIKE_TYPES.has(child.type)) return child;
+    const found = findFunctionNode(child);
+    if (found) return found;
   }
 
   return null;

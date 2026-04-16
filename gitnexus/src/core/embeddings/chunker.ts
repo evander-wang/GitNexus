@@ -11,7 +11,8 @@ export { type Chunk, characterChunk } from './character-chunk.js';
 
 import { characterChunk } from './character-chunk.js';
 import type { Chunk } from './character-chunk.js';
-import { ensureAndParse, findNodeByRange } from './ast-utils.js';
+import { ensureAndParse, findDeclarationNode, findFunctionNode } from './ast-utils.js';
+import { buildLineIndex, resolveChunkLines } from './line-index.js';
 
 /**
  * Main chunkNode function: dispatches by label
@@ -27,14 +28,40 @@ export const chunkNode = async (
 ): Promise<Chunk[]> => {
   // Content fits in one chunk — no splitting needed
   if (content.length <= chunkSize) {
-    return [{ text: content, chunkIndex: 0, startLine, endLine }];
+    return [
+      {
+        text: content,
+        chunkIndex: 0,
+        startOffset: 0,
+        endOffset: content.length,
+        startLine,
+        endLine,
+      },
+    ];
   }
 
-  // Only Function/Method get AST chunking
-  if (label === 'Function' || label === 'Method') {
+  // Only function-like labels get AST chunking
+  if (label === 'Function' || label === 'Method' || label === 'Constructor') {
     try {
       const astChunks = await astChunk(content, filePath, startLine, endLine, chunkSize, overlap);
       if (astChunks.length > 0) return astChunks;
+    } catch {
+      // AST parsing failed — fall through to character fallback
+    }
+  }
+
+  if (label === 'Class' || label === 'Interface') {
+    try {
+      const declarationChunks = await declarationChunk(
+        label,
+        content,
+        filePath,
+        startLine,
+        endLine,
+        chunkSize,
+        overlap,
+      );
+      if (declarationChunks.length > 0) return declarationChunks;
     } catch {
       // AST parsing failed — fall through to character fallback
     }
@@ -46,7 +73,8 @@ export const chunkNode = async (
 
 /**
  * AST-based chunking for Function/Method
- * Parse file, locate node by startLine/endLine, split body by statements
+ * Parse snippet content, locate the function declaration node,
+ * split body by statement boundaries.
  */
 const astChunk = async (
   content: string,
@@ -60,9 +88,11 @@ const astChunk = async (
   if (!tree) return [];
 
   const root = tree.rootNode;
+  const lineOffsets = buildLineIndex(content);
 
-  // Find the node matching our startLine/endLine (0-based in tree-sitter)
-  const targetNode = findNodeByRange(root, startLine, endLine);
+  // Find the function/method declaration in the snippet AST.
+  // tree-sitter parses node.content (a snippet), so rows are relative (0-based).
+  const targetNode = findFunctionNode(root);
   if (!targetNode) return [];
 
   // Get the body (statements) via childForFieldName('body')
@@ -70,82 +100,264 @@ const astChunk = async (
   if (!bodyNode) return [];
 
   // Extract individual statements
-  const statements: Array<{ text: string; startRow: number; endRow: number }> = [];
+  const statements: Array<{ startIndex: number; endIndex: number }> = [];
   for (let i = 0; i < bodyNode.namedChildCount; i++) {
     const child = bodyNode.namedChild(i);
     if (!child) continue;
     statements.push({
-      text: child.text,
-      startRow: child.startPosition.row,
-      endRow: child.endPosition.row,
+      startIndex: child.startIndex,
+      endIndex: child.endIndex,
     });
   }
 
   if (statements.length === 0) return [];
 
-  // Extract signature (everything before the body)
-  const bodyStart = bodyNode.startIndex;
-  const signature = content.slice(0, bodyStart).trim();
+  return chunkByUnits(
+    content,
+    lineOffsets,
+    startLine,
+    chunkSize,
+    overlap,
+    statements,
+    targetNode.startIndex,
+    targetNode.endIndex,
+    true,
+    true,
+  );
+};
 
-  // Greedy merge statements into chunks
+const DECLARATION_BODY_NODE_TYPES = new Set([
+  'class_body',
+  'object_type',
+  'declaration_list',
+  'interface_body',
+]);
+
+const FIELD_LIKE_MEMBER_TYPES = new Set([
+  'field_definition',
+  'public_field_definition',
+  'property_definition',
+  'property_signature',
+  'variable_declarator',
+  'lexical_declaration',
+  'pair',
+  'enum_assignment',
+]);
+
+const declarationChunk = async (
+  label: 'Class' | 'Interface',
+  content: string,
+  filePath: string,
+  startLine: number,
+  endLine: number,
+  chunkSize: number,
+  overlap: number,
+): Promise<Chunk[]> => {
+  const tree = await ensureAndParse(content, filePath);
+  if (!tree) return [];
+
+  const targetNode = findDeclarationNode(tree.rootNode);
+  if (!targetNode) return [];
+
+  const bodyNode = getDeclarationBodyNode(targetNode);
+  if (!bodyNode) return [];
+
+  const members = collectDeclarationUnits(bodyNode, label);
+  if (members.length === 0) return [];
+
+  return chunkByUnits(
+    content,
+    buildLineIndex(content),
+    startLine,
+    chunkSize,
+    overlap,
+    members,
+    targetNode.startIndex,
+    targetNode.endIndex,
+    false,
+    false,
+  );
+};
+
+const buildChunk = (
+  content: string,
+  lineOffsets: Int32Array,
+  chunkIndex: number,
+  startOffset: number,
+  endOffset: number,
+  baseStartLine: number,
+): Chunk => {
+  const lineRange = resolveChunkLines(lineOffsets, startOffset, endOffset, baseStartLine);
+  return {
+    text: content.slice(startOffset, endOffset),
+    chunkIndex,
+    startOffset,
+    endOffset,
+    startLine: lineRange.startLine,
+    endLine: lineRange.endLine,
+  };
+};
+
+const chunkByUnits = (
+  content: string,
+  lineOffsets: Int32Array,
+  baseStartLine: number,
+  chunkSize: number,
+  overlap: number,
+  units: Array<{ startIndex: number; endIndex: number }>,
+  containerStartOffset: number,
+  containerEndOffset: number,
+  includeContainerPrefixOnFirstChunk: boolean,
+  includeContainerSuffixOnLastChunk: boolean,
+): Chunk[] => {
   const chunks: Chunk[] = [];
-  let currentText = '';
-  let currentStartRow = startLine;
-  let currentEndRow = startLine;
-  let isFirst = true;
+  let chunkStartUnitIdx = 0;
 
-  for (const stmt of statements) {
-    const candidateText = currentText ? `${currentText}\n${stmt.text}` : stmt.text;
+  while (chunkStartUnitIdx < units.length) {
+    const chunkStartOffset =
+      chunkStartUnitIdx === 0 && includeContainerPrefixOnFirstChunk
+        ? containerStartOffset
+        : units[chunkStartUnitIdx].startIndex;
 
-    // For first chunk, include signature
-    const fullCandidate = isFirst ? `${signature}\n${candidateText}` : candidateText;
+    let chunkEndUnitIdx = chunkStartUnitIdx;
+    let candidateEndOffset =
+      chunkEndUnitIdx === units.length - 1 && includeContainerSuffixOnLastChunk
+        ? containerEndOffset
+        : units[chunkEndUnitIdx].endIndex;
 
-    if (fullCandidate.length > chunkSize && currentText.length > 0) {
-      // Current chunk is full — emit it
-      chunks.push({
-        text: isFirst ? `${signature}\n${currentText}` : currentText,
-        chunkIndex: chunks.length,
-        startLine: currentStartRow + 1, // 1-based
-        endLine: currentEndRow + 1,
-      });
-      // Start new chunk with overlap
-      currentText = overlapText(currentText, overlap) + '\n' + stmt.text;
-      currentStartRow = stmt.startRow;
-      isFirst = false;
-    } else {
-      currentText = candidateText;
+    while (chunkEndUnitIdx + 1 < units.length) {
+      const nextEndOffset =
+        chunkEndUnitIdx + 1 === units.length - 1 && includeContainerSuffixOnLastChunk
+          ? containerEndOffset
+          : units[chunkEndUnitIdx + 1].endIndex;
+      if (nextEndOffset - chunkStartOffset > chunkSize) break;
+      chunkEndUnitIdx += 1;
+      candidateEndOffset = nextEndOffset;
     }
-    currentEndRow = stmt.endRow;
-  }
 
-  // Emit remaining chunk
-  if (currentText.length > 0) {
-    chunks.push({
-      text: isFirst ? `${signature}\n${currentText}` : currentText,
-      chunkIndex: chunks.length,
-      startLine: currentStartRow + 1,
-      endLine: currentEndRow + 1,
-    });
-  }
+    if (candidateEndOffset - chunkStartOffset > chunkSize) {
+      const oversizedUnit = units[chunkStartUnitIdx];
+      const oversizedLineRange = resolveChunkLines(
+        lineOffsets,
+        oversizedUnit.startIndex,
+        oversizedUnit.endIndex,
+        baseStartLine,
+      );
+      const oversizedChunks = characterChunk(
+        content.slice(oversizedUnit.startIndex, oversizedUnit.endIndex),
+        oversizedLineRange.startLine,
+        oversizedLineRange.endLine,
+        chunkSize,
+        overlap,
+      ).map((chunk, offsetIdx) => ({
+        ...chunk,
+        chunkIndex: chunks.length + offsetIdx,
+        startOffset: chunk.startOffset + oversizedUnit.startIndex,
+        endOffset: chunk.endOffset + oversizedUnit.startIndex,
+      }));
+      chunks.push(...oversizedChunks);
+      chunkStartUnitIdx += 1;
+      continue;
+    }
 
-  // Handle single statement longer than chunkSize — character fallback
-  if (chunks.length === 1 && chunks[0].text.length > chunkSize) {
-    return characterChunk(content, startLine, endLine, chunkSize, overlap);
+    chunks.push(
+      buildChunk(
+        content,
+        lineOffsets,
+        chunks.length,
+        chunkStartOffset,
+        candidateEndOffset,
+        baseStartLine,
+      ),
+    );
+
+    if (chunkEndUnitIdx === units.length - 1) {
+      break;
+    }
+
+    const nextChunkStartUnitIdx = findOverlapStartIndex(
+      units,
+      chunkStartUnitIdx,
+      chunkEndUnitIdx,
+      overlap,
+    );
+    if (nextChunkStartUnitIdx <= chunkStartUnitIdx) {
+      chunkStartUnitIdx = chunkEndUnitIdx + 1;
+    } else {
+      chunkStartUnitIdx = nextChunkStartUnitIdx;
+    }
   }
 
   return chunks;
 };
 
-/**
- * Extract overlap text with line-boundary awareness.
- * Prefers starting at a newline to avoid splitting mid-identifier.
- */
-const overlapText = (text: string, overlapSize: number): string => {
-  if (text.length <= overlapSize) return text;
-  const start = text.length - overlapSize;
-  const newlineIdx = text.indexOf('\n', start);
-  if (newlineIdx >= 0 && newlineIdx < start + 50) {
-    return text.slice(newlineIdx + 1);
+const findOverlapStartIndex = (
+  statements: Array<{ startIndex: number; endIndex: number }>,
+  chunkStartStmtIdx: number,
+  chunkEndStmtIdx: number,
+  overlapSize: number,
+): number => {
+  if (overlapSize <= 0) return chunkEndStmtIdx + 1;
+
+  let overlapStartIdx = chunkEndStmtIdx;
+  while (overlapStartIdx > chunkStartStmtIdx) {
+    const overlapLength =
+      statements[chunkEndStmtIdx].endIndex - statements[overlapStartIdx - 1].startIndex;
+    if (overlapLength > overlapSize) break;
+    overlapStartIdx -= 1;
   }
-  return text.slice(start);
+
+  return overlapStartIdx;
+};
+
+const getDeclarationBodyNode = (node: any): any | null => {
+  const bodyNode = node.childForFieldName?.('body');
+  if (bodyNode) return bodyNode;
+
+  for (let i = 0; i < node.namedChildCount; i++) {
+    const child = node.namedChild(i);
+    if (!child) continue;
+    if (DECLARATION_BODY_NODE_TYPES.has(child.type)) return child;
+  }
+
+  return null;
+};
+
+const collectDeclarationUnits = (
+  bodyNode: any,
+  label: 'Class' | 'Interface',
+): Array<{ startIndex: number; endIndex: number }> => {
+  const members: Array<{ startIndex: number; endIndex: number; groupable: boolean }> = [];
+
+  for (let i = 0; i < bodyNode.namedChildCount; i++) {
+    const child = bodyNode.namedChild(i);
+    if (!child) continue;
+    members.push({
+      startIndex: child.startIndex,
+      endIndex: child.endIndex,
+      groupable: label === 'Class' && FIELD_LIKE_MEMBER_TYPES.has(child.type),
+    });
+  }
+
+  if (members.length === 0) return [];
+
+  const grouped: Array<{ startIndex: number; endIndex: number }> = [];
+  let current = members[0];
+
+  for (let i = 1; i < members.length; i++) {
+    const next = members[i];
+    if (current.groupable && next.groupable) {
+      current = {
+        startIndex: current.startIndex,
+        endIndex: next.endIndex,
+        groupable: true,
+      };
+      continue;
+    }
+    grouped.push({ startIndex: current.startIndex, endIndex: current.endIndex });
+    current = next;
+  }
+
+  grouped.push({ startIndex: current.startIndex, endIndex: current.endIndex });
+  return grouped;
 };

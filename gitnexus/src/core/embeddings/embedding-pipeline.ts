@@ -32,6 +32,7 @@ import {
   isShortLabel,
   LABELS_WITH_EXPORTED,
   STRUCTURAL_LABELS,
+  collectBestChunks,
 } from './types.js';
 import {
   EMBEDDING_TABLE_NAME,
@@ -53,7 +54,14 @@ export const contentHashForNode = (
   node: EmbeddableNode,
   config: Partial<EmbeddingConfig> = {},
 ): string => {
-  const text = generateEmbeddingText(node, node.content, config);
+  // Hash must be deterministic across runs, so exclude methodNames/fieldNames
+  // which are populated during the batch loop via AST extraction.
+  // Using only node.content ensures the hash stays stable.
+  const text = generateEmbeddingText(
+    { ...node, methodNames: undefined, fieldNames: undefined },
+    node.content,
+    config,
+  );
   return createHash('sha1').update(text).digest('hex');
 };
 
@@ -107,6 +115,7 @@ const queryEmbeddableNodes = async (
 
       const rows = await executeQuery(query);
       for (const row of rows) {
+        const hasExportedColumn = label === 'Method' || LABELS_WITH_EXPORTED.has(label);
         allNodes.push({
           id: row.id ?? row[0],
           name: row.name ?? row[1],
@@ -115,8 +124,8 @@ const queryEmbeddableNodes = async (
           content: row.content ?? row[4] ?? '',
           startLine: row.startLine ?? row[5],
           endLine: row.endLine ?? row[6],
-          isExported: row.isExported ?? row[7],
-          description: row.description ?? (label === 'Method' ? row[8] : row[7]),
+          isExported: hasExportedColumn ? (row.isExported ?? row[7]) : undefined,
+          description: row.description ?? (hasExportedColumn ? row[8] : row[7]),
           ...(label === 'Method'
             ? {
                 parameterCount: row.parameterCount ?? row[9],
@@ -359,6 +368,7 @@ export const runEmbeddingPipeline = async (
         chunkIndex: number;
         startLine: number;
         endLine: number;
+        contentHash: string;
       }> = [];
 
       for (const node of batch) {
@@ -376,6 +386,9 @@ export const runEmbeddingPipeline = async (
             // AST extraction failed — names stay undefined, text-generator handles gracefully
           }
         }
+
+        // Compute content hash once per node (re-use cached value for stale nodes)
+        const hash = computedStaleHashes.get(node.id) ?? contentHashForNode(node, finalConfig);
 
         let chunks: Array<{ text: string; chunkIndex: number; startLine: number; endLine: number }>;
         if (isShort) {
@@ -410,6 +423,7 @@ export const runEmbeddingPipeline = async (
             chunkIndex: chunk.chunkIndex,
             startLine: chunk.startLine,
             endLine: chunk.endLine,
+            contentHash: hash,
           });
         }
       }
@@ -513,42 +527,30 @@ export const semanticSearch = async (
   const queryVec = embeddingToArray(queryEmbedding);
   const queryVecStr = `[${queryVec.join(',')}]`;
 
-  // Query vector index — get nodeId, chunkIndex, distance
-  const vectorQuery = `
-    CALL QUERY_VECTOR_INDEX('${EMBEDDING_TABLE_NAME}', '${EMBEDDING_INDEX_NAME}', 
+  const bestChunks = await collectBestChunks(k, async (fetchLimit) => {
+    const vectorQuery = `
+      CALL QUERY_VECTOR_INDEX('${EMBEDDING_TABLE_NAME}', '${EMBEDDING_INDEX_NAME}',
+        CAST(${queryVecStr} AS FLOAT[${queryVec.length}]), ${fetchLimit})
+      YIELD node AS emb, distance
+      WITH emb, distance
+      WHERE distance < ${maxDistance}
+      RETURN emb.nodeId AS nodeId, emb.chunkIndex AS chunkIndex,
+             emb.startLine AS startLine, emb.endLine AS endLine, distance
+      ORDER BY distance
+    `;
 
-      CAST(${queryVecStr} AS FLOAT[${queryVec.length}]), ${k})
-    YIELD node AS emb, distance
-    WITH emb, distance
-    WHERE distance < ${maxDistance}
-    RETURN emb.nodeId AS nodeId, emb.chunkIndex AS chunkIndex,
-           emb.startLine AS startLine, emb.endLine AS endLine, distance
-    ORDER BY distance
-  `;
+    const embResults = await executeQuery(vectorQuery);
+    return embResults.map((row) => ({
+      nodeId: row.nodeId ?? row[0],
+      chunkIndex: row.chunkIndex ?? row[1] ?? 0,
+      startLine: row.startLine ?? row[2] ?? 0,
+      endLine: row.endLine ?? row[3] ?? 0,
+      distance: row.distance ?? row[4],
+    }));
+  });
 
-  const embResults = await executeQuery(vectorQuery);
-
-  if (embResults.length === 0) {
+  if (bestChunks.size === 0) {
     return [];
-  }
-
-  // Deduplicate by nodeId — keep chunk with smallest distance
-  const bestChunks = new Map<
-    string,
-    { chunkIndex: number; startLine: number; endLine: number; distance: number }
-  >();
-
-  for (const row of embResults) {
-    const nodeId = row.nodeId ?? row[0];
-    const chunkIndex = row.chunkIndex ?? row[1] ?? 0;
-    const startLine = row.startLine ?? row[2] ?? 0;
-    const endLine = row.endLine ?? row[3] ?? 0;
-    const distance = row.distance ?? row[4];
-
-    const existing = bestChunks.get(nodeId);
-    if (!existing || distance < existing.distance) {
-      bestChunks.set(nodeId, { chunkIndex, startLine, endLine, distance });
-    }
   }
 
   // Group results by label for batched metadata queries
@@ -556,7 +558,7 @@ export const semanticSearch = async (
     string,
     Array<{ nodeId: string; distance: number } & Record<string, any>>
   >();
-  for (const [nodeId, chunk] of bestChunks) {
+  for (const [nodeId, chunk] of Array.from(bestChunks.entries()).slice(0, k)) {
     const labelEndIdx = nodeId.indexOf(':');
     const label = labelEndIdx > 0 ? nodeId.substring(0, labelEndIdx) : 'Unknown';
     if (!byLabel.has(label)) byLabel.set(label, []);
