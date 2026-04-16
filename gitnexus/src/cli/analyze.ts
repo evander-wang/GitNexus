@@ -67,6 +67,7 @@ export const analyzeCommand = async (inputPath?: string, options?: AnalyzeOption
   if (options?.verbose) {
     process.env.GITNEXUS_VERBOSE = '1';
   }
+  const plainOutput = options?.verbose || process.env.NODE_ENV === 'development';
 
   console.log('\n  GitNexus Analyzer\n');
 
@@ -128,14 +129,18 @@ export const analyzeCommand = async (inputPath?: string, options?: AnalyzeOption
     cliProgress.Presets.shades_grey,
   );
 
-  bar.start(100, 0, { phase: 'Initializing...' });
+  if (!plainOutput) {
+    bar.start(100, 0, { phase: 'Initializing...' });
+  }
 
   // Graceful SIGINT handling
   let aborted = false;
   const sigintHandler = () => {
     if (aborted) process.exit(1);
     aborted = true;
-    bar.stop();
+    if (!plainOutput) {
+      bar.stop();
+    }
     console.log('\n  Interrupted — cleaning up...');
     closeLbug()
       .catch(() => {})
@@ -149,32 +154,49 @@ export const analyzeCommand = async (inputPath?: string, options?: AnalyzeOption
   const origError = console.error.bind(console);
   let barCurrentValue = 0;
   const barLog = (...args: any[]) => {
-    process.stdout.write('\x1b[2K\r');
+    if (!plainOutput) {
+      process.stdout.write('\x1b[2K\r');
+    }
     origLog(args.map((a) => (typeof a === 'string' ? a : String(a))).join(' '));
-    bar.update(barCurrentValue);
+    if (!plainOutput) {
+      bar.update(barCurrentValue);
+    }
   };
-  console.log = barLog;
-  console.warn = barLog;
-  console.error = barLog;
+  if (!plainOutput) {
+    console.log = barLog;
+    console.warn = barLog;
+    console.error = barLog;
+  }
 
   // Track elapsed time per phase
   let lastPhaseLabel = 'Initializing...';
   let phaseStart = Date.now();
+  let lastLoggedPhase = '';
+  let lastLoggedPercent = -10;
 
   const updateBar = (value: number, phaseLabel: string) => {
+    const phaseChanged = phaseLabel !== lastPhaseLabel;
     barCurrentValue = value;
-    if (phaseLabel !== lastPhaseLabel) {
+    if (phaseChanged) {
       lastPhaseLabel = phaseLabel;
       phaseStart = Date.now();
     }
     const elapsed = Math.round((Date.now() - phaseStart) / 1000);
     const display = elapsed >= 3 ? `${phaseLabel} (${elapsed}s)` : phaseLabel;
+    if (plainOutput) {
+      if (phaseChanged || value === 100 || value - lastLoggedPercent >= 10) {
+        lastLoggedPhase = phaseLabel;
+        lastLoggedPercent = value;
+        origLog(`  [${value}%] ${display}`);
+      }
+      return;
+    }
     bar.update(value, { phase: display });
   };
 
   const elapsedTimer = setInterval(() => {
     const elapsed = Math.round((Date.now() - phaseStart) / 1000);
-    if (elapsed >= 3) {
+    if (!plainOutput && elapsed >= 3) {
       bar.update({ phase: `${lastPhaseLabel} (${elapsed}s)` });
     }
   }, 1000);
@@ -196,17 +218,19 @@ export const analyzeCommand = async (inputPath?: string, options?: AnalyzeOption
         onProgress: (_phase, percent, message) => {
           updateBar(percent, message);
         },
-        onLog: barLog,
+        onLog: plainOutput ? origLog : barLog,
       },
     );
 
     if (result.alreadyUpToDate) {
       clearInterval(elapsedTimer);
       process.removeListener('SIGINT', sigintHandler);
-      console.log = origLog;
-      console.warn = origWarn;
-      console.error = origError;
-      bar.stop();
+      if (!plainOutput) {
+        console.log = origLog;
+        console.warn = origWarn;
+        console.error = origError;
+        bar.stop();
+      }
       console.log('  Already up to date\n');
       // Safe to return without process.exit(0) — the early-return path in
       // runFullAnalysis never opens LadybugDB, so no native handles prevent exit.
@@ -225,7 +249,7 @@ export const analyzeCommand = async (inputPath?: string, options?: AnalyzeOption
           result.pipelineResult,
         );
         if (skillResult.skills.length > 0) {
-          barLog(`  Generated ${skillResult.skills.length} skill files`);
+          (plainOutput ? origLog : barLog)(`  Generated ${skillResult.skills.length} skill files`);
           // Re-generate AI context files now that we have skill info
           const s = result.stats;
           const communityResult = result.pipelineResult?.communityResult;
@@ -267,12 +291,13 @@ export const analyzeCommand = async (inputPath?: string, options?: AnalyzeOption
     clearInterval(elapsedTimer);
     process.removeListener('SIGINT', sigintHandler);
 
-    console.log = origLog;
-    console.warn = origWarn;
-    console.error = origError;
-
-    bar.update(100, { phase: 'Done' });
-    bar.stop();
+    if (!plainOutput) {
+      console.log = origLog;
+      console.warn = origWarn;
+      console.error = origError;
+      bar.update(100, { phase: 'Done' });
+      bar.stop();
+    }
 
     // ── Summary ────────────────────────────────────────────────────
     const s = result.stats;
@@ -292,10 +317,12 @@ export const analyzeCommand = async (inputPath?: string, options?: AnalyzeOption
   } catch (err: any) {
     clearInterval(elapsedTimer);
     process.removeListener('SIGINT', sigintHandler);
-    console.log = origLog;
-    console.warn = origWarn;
-    console.error = origError;
-    bar.stop();
+    if (!plainOutput) {
+      console.log = origLog;
+      console.warn = origWarn;
+      console.error = origError;
+      bar.stop();
+    }
 
     const msg = err.message || String(err);
     console.error(`\n  Analysis failed: ${msg}\n`);

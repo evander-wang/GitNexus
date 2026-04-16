@@ -123,6 +123,7 @@ const astChunk = async (
     targetNode.endIndex,
     true,
     true,
+    'ast-function',
   );
 };
 
@@ -176,6 +177,7 @@ const declarationChunk = async (
     targetNode.endIndex,
     false,
     false,
+    'ast-declaration',
   );
 };
 
@@ -186,6 +188,7 @@ const buildChunk = (
   startOffset: number,
   endOffset: number,
   baseStartLine: number,
+  strategy: 'ast-function' | 'ast-declaration',
 ): Chunk => {
   const lineRange = resolveChunkLines(lineOffsets, startOffset, endOffset, baseStartLine);
   return {
@@ -195,6 +198,7 @@ const buildChunk = (
     endOffset,
     startLine: lineRange.startLine,
     endLine: lineRange.endLine,
+    strategy,
   };
 };
 
@@ -209,6 +213,7 @@ const chunkByUnits = (
   containerEndOffset: number,
   includeContainerPrefixOnFirstChunk: boolean,
   includeContainerSuffixOnLastChunk: boolean,
+  strategy: 'ast-function' | 'ast-declaration',
 ): Chunk[] => {
   const chunks: Chunk[] = [];
   let chunkStartUnitIdx = 0;
@@ -268,6 +273,7 @@ const chunkByUnits = (
         chunkStartOffset,
         candidateEndOffset,
         baseStartLine,
+        strategy,
       ),
     );
 

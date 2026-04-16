@@ -43,6 +43,7 @@ import {
 import { loadVectorExtension } from '../lbug/lbug-adapter.js';
 
 const isDev = process.env.NODE_ENV === 'development';
+const isVerboseDev = isDev && process.env.GITNEXUS_VERBOSE === '1';
 
 /**
  * Compute a stable content fingerprint for an embeddable node.
@@ -347,6 +348,7 @@ export const runEmbeddingPipeline = async (
     const overlap = finalConfig.overlap;
     let processedNodes = 0;
     let totalChunks = 0;
+    const chunkStrategyCounts = new Map<string, number>();
 
     onProgress({
       phase: 'embedding',
@@ -390,7 +392,13 @@ export const runEmbeddingPipeline = async (
         // Compute content hash once per node (re-use cached value for stale nodes)
         const hash = computedStaleHashes.get(node.id) ?? contentHashForNode(node, finalConfig);
 
-        let chunks: Array<{ text: string; chunkIndex: number; startLine: number; endLine: number }>;
+        let chunks: Array<{
+          text: string;
+          chunkIndex: number;
+          startLine: number;
+          endLine: number;
+          strategy?: 'character' | 'ast-function' | 'ast-declaration';
+        }>;
         if (isShort) {
           chunks = [{ text: node.content, chunkIndex: 0, startLine, endLine }];
         } else {
@@ -425,6 +433,15 @@ export const runEmbeddingPipeline = async (
             endLine: chunk.endLine,
             contentHash: hash,
           });
+        }
+
+        const strategy = chunks[0]?.strategy ?? 'character';
+        chunkStrategyCounts.set(strategy, (chunkStrategyCounts.get(strategy) ?? 0) + 1);
+
+        if (isVerboseDev && !isShort) {
+          console.log(
+            `🧩 ${node.label} "${node.name}" -> ${strategy} (${chunks.length} chunks, ${node.filePath}:${startLine}-${endLine})`,
+          );
         }
       }
 
@@ -489,6 +506,12 @@ export const runEmbeddingPipeline = async (
     });
 
     if (isDev) {
+      if (chunkStrategyCounts.size > 0) {
+        const summary = Array.from(chunkStrategyCounts.entries())
+          .map(([strategy, count]) => `${strategy}=${count}`)
+          .join(', ');
+        console.log(`🧾 Chunk strategies: ${summary}`);
+      }
       console.log(
         `✅ Embedding pipeline complete! (${totalChunks} chunks from ${totalNodes} nodes)`,
       );

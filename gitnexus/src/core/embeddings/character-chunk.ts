@@ -11,6 +11,7 @@ export interface Chunk {
   endOffset: number;
   startLine: number;
   endLine: number;
+  strategy?: 'character' | 'ast-function' | 'ast-declaration';
 }
 
 export const characterChunk = (
@@ -29,6 +30,7 @@ export const characterChunk = (
         endOffset: content.length,
         startLine,
         endLine,
+        strategy: 'character',
       },
     ];
   }
@@ -49,6 +51,7 @@ export const characterChunk = (
       endOffset: end,
       startLine: lineRange.startLine,
       endLine: lineRange.endLine,
+      strategy: 'character',
     });
 
     offset = end - overlap;
