@@ -62,6 +62,12 @@ export const getRemoteUrl = (repoPath: string): string | undefined => {
 
   // Lower-case the host segment of `scheme://[user@]host[:port]/...`
   // and the host segment of `git@host:owner/repo` SCP form.
+  // SSH user-segment regex deliberately accepts the common
+  // `git@`/`<alnum>-_@` cases. Less common usernames (e.g. with
+  // dots) fall through to the URL-form branch — they will simply
+  // not get host-case normalisation, which is acceptable: the raw
+  // `git config` output is still a valid fingerprint, just slightly
+  // less collapsible across host casings.
   const sshMatch = normalised.match(/^(git@|[a-zA-Z0-9_-]+@)([^:/]+)(:.+)$/);
   if (sshMatch) {
     normalised = `${sshMatch[1]}${sshMatch[2].toLowerCase()}${sshMatch[3]}`;

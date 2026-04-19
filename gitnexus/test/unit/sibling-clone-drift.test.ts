@@ -36,11 +36,6 @@ const initRepoWithCommit = (dir: string, remoteUrl?: string): string => {
   return execSync('git rev-parse HEAD', { cwd: dir }).toString().trim();
 };
 
-const advanceCommit = (dir: string): string => {
-  execSync('git commit --allow-empty -q -m advance', { cwd: dir });
-  return execSync('git rev-parse HEAD', { cwd: dir }).toString().trim();
-};
-
 describe('registry persists remoteUrl', () => {
   let tmpHome: Awaited<ReturnType<typeof createTempDir>>;
   let tmpRepo: Awaited<ReturnType<typeof createTempDir>>;
@@ -178,19 +173,22 @@ describe('checkCwdMatch', () => {
     }
   });
 
-  it('detects sibling-by-remote at the same commit (no drift hint)', async () => {
+  it('detects sibling-by-remote when sibling HEAD differs from indexed commit', async () => {
     const indexed = await createTempDir('cwd-indexed-');
     const sibling = await createTempDir('cwd-sibling-');
     try {
       const remote = 'https://example.com/foo/bar';
       const indexedHead = initRepoWithCommit(indexed.dbPath, remote);
-      // Sibling is a separate `git init` with the same remote URL and
-      // an identical-message empty commit — that's enough for the
-      // remote-URL-based fingerprint to match. Commits differ; we use
-      // the same lastCommit for the registered side anyway because
-      // the warning logic only cares about the *registered* commit
-      // vs the cwd HEAD.
-      initRepoWithCommit(sibling.dbPath, remote);
+      // Sibling is a separate `git init` with the same remote URL —
+      // that's enough for the remote-URL-based fingerprint to match.
+      // Use a distinct commit message so the sibling's SHA cannot
+      // coincidentally collide with the indexed one even when both
+      // commits land in the same second.
+      execSync('git init -q', { cwd: sibling.dbPath });
+      execSync('git config user.email test@example.com', { cwd: sibling.dbPath });
+      execSync('git config user.name test', { cwd: sibling.dbPath });
+      execSync('git commit --allow-empty -q -m sibling-distinct', { cwd: sibling.dbPath });
+      execSync(`git remote add origin ${remote}`, { cwd: sibling.dbPath });
 
       await registerRepo(indexed.dbPath, {
         repoPath: indexed.dbPath,
@@ -247,13 +245,15 @@ describe('checkCwdMatch', () => {
       // Use a fabricated indexed commit that doesn't exist in the
       // sibling clone — git rev-list will fail and `drift` is left
       // undefined. The hint must still flag this as a stale-or-divergent
-      // sibling clone.
-      const fakeIndexedCommit = '0000000000000000000000000000000000000000';
+      // sibling clone. Named to make test intent obvious; not git's
+      // all-zero "null" OID, which has special semantics in some git
+      // commands.
+      const FAKE_INDEXED_COMMIT = 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef';
       initRepoWithCommit(sibling.dbPath, remote);
 
       await registerRepo(indexed.dbPath, {
         repoPath: indexed.dbPath,
-        lastCommit: fakeIndexedCommit,
+        lastCommit: FAKE_INDEXED_COMMIT,
         indexedAt: new Date().toISOString(),
         remoteUrl: remote,
       });
@@ -261,8 +261,42 @@ describe('checkCwdMatch', () => {
       const m = await checkCwdMatch(sibling.dbPath);
       expect(m.match).toBe('sibling-by-remote');
       expect(m.cwdHead).toBeTruthy();
-      expect(m.cwdHead).not.toBe(fakeIndexedCommit);
+      expect(m.cwdHead).not.toBe(FAKE_INDEXED_COMMIT);
       expect(m.hint).toMatch(/sibling clone/);
+    } finally {
+      await indexed.cleanup();
+      await sibling.cleanup();
+    }
+  });
+
+  it('omits hint when sibling cwd HEAD matches the indexed commit (no drift)', async () => {
+    // Same-commit sibling: the relationship is real (and surfaces in
+    // `match: 'sibling-by-remote'`) but there is nothing to warn
+    // about. `LocalBackend.maybeWarnSiblingDrift` short-circuits in
+    // exactly this case, so confirming `hint` is unset here pins the
+    // contract those two pieces of code rely on.
+    const indexed = await createTempDir('cwd-same-indexed-');
+    const sibling = await createTempDir('cwd-same-sibling-');
+    try {
+      const remote = 'https://example.com/foo/bar';
+      initRepoWithCommit(indexed.dbPath, remote);
+      const siblingHead = initRepoWithCommit(sibling.dbPath, remote);
+
+      // Register the indexed entry with the SIBLING's HEAD as
+      // `lastCommit`. That is the on-disk reality when both clones
+      // happen to be at the same commit hash — e.g. immediately
+      // after both fast-forwarded to the same `main`.
+      await registerRepo(indexed.dbPath, {
+        repoPath: indexed.dbPath,
+        lastCommit: siblingHead,
+        indexedAt: new Date().toISOString(),
+        remoteUrl: remote,
+      });
+
+      const m = await checkCwdMatch(sibling.dbPath);
+      expect(m.match).toBe('sibling-by-remote');
+      expect(m.cwdHead).toBe(siblingHead);
+      expect(m.hint).toBeUndefined();
     } finally {
       await indexed.cleanup();
       await sibling.cleanup();

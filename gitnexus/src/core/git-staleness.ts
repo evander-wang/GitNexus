@@ -123,11 +123,15 @@ export async function checkCwdMatch(cwd: string): Promise<CwdMatch> {
   const cwdHead = getCurrentCommit(cwdGitRoot) || undefined;
   const drift = commitsAheadOfIndexed(cwdGitRoot, sibling.lastCommit);
 
-  let hint: string;
+  // Same commit on both clones → still report match=sibling-by-remote
+  // (the relationship is real and useful to callers like list_repos /
+  // future tooling) but leave `hint` unset: there's nothing to warn
+  // about, and `maybeWarnSiblingDrift` already short-circuits this
+  // case independently. Surfacing a no-op hint would force callers
+  // to second-guess whether they need to display it.
+  let hint: string | undefined;
   if (cwdHead && cwdHead === sibling.lastCommit) {
-    hint =
-      `ℹ️ Indexed clone "${sibling.name}" lives at ${sibling.path}; ` +
-      `your cwd (${cwdGitRoot}) is a different clone of the same repo at the same commit — results apply.`;
+    hint = undefined;
   } else if (drift && drift > 0) {
     hint =
       `⚠️ Index for "${sibling.name}" was built at ${sibling.path}; ` +
