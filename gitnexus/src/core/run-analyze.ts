@@ -30,7 +30,7 @@ import {
   registerRepo,
   cleanupOldKuzuFiles,
 } from '../storage/repo-manager.js';
-import { getCurrentCommit, hasGitDir } from '../storage/git.js';
+import { getCurrentCommit, getRemoteUrl, hasGitDir } from '../storage/git.js';
 import type { CachedEmbedding } from './embeddings/types.js';
 import { generateAIContextFiles } from '../cli/ai-context.js';
 import { EMBEDDING_TABLE_NAME } from './lbug/schema.js';
@@ -324,6 +324,13 @@ export async function runFullAnalysis(
       repoPath,
       lastCommit: currentCommit,
       indexedAt: new Date().toISOString(),
+      // Captured here (not at registration) so it travels with the
+      // on-disk meta.json — sibling-clone fingerprinting works for
+      // out-of-tree consumers (group-status, future tooling) without
+      // a second git shellout. `undefined` when the repo has no
+      // origin remote, which is fine: paths-only repos behave as
+      // before.
+      remoteUrl: hasGitDir(repoPath) ? getRemoteUrl(repoPath) : undefined,
       stats: {
         files: pipelineResult.totalFileCount,
         nodes: stats.nodes,

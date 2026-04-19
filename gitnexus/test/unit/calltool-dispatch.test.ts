@@ -37,6 +37,15 @@ vi.mock('../../src/mcp/core/lbug-adapter.js', async (importOriginal) => {
 vi.mock('../../src/storage/repo-manager.js', () => ({
   listRegisteredRepos: vi.fn().mockResolvedValue([]),
   cleanupOldKuzuFiles: vi.fn().mockResolvedValue({ found: false, needsReindex: false }),
+  findSiblingClones: vi.fn().mockResolvedValue([]),
+}));
+
+// `core/git-staleness` is also imported by `local-backend.ts` (for
+// `checkStaleness` and `checkCwdMatch`). Stub it out here so unit
+// tests don't shell out to git.
+vi.mock('../../src/core/git-staleness.js', () => ({
+  checkStaleness: vi.fn().mockReturnValue({ isStale: false, commitsBehind: 0 }),
+  checkCwdMatch: vi.fn().mockResolvedValue({ match: 'none' }),
 }));
 
 // Also mock the search modules to avoid loading onnxruntime

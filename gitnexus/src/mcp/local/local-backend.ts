@@ -25,12 +25,14 @@ import { parseDiffHunks, type FileDiff } from '../../storage/git.js';
 import {
   listRegisteredRepos,
   cleanupOldKuzuFiles,
+  findSiblingClones,
   type RegistryEntry,
 } from '../../storage/repo-manager.js';
 import { GroupService, type GroupToolPort } from '../../core/group/service.js';
 import { collectBestChunks } from '../../core/embeddings/types.js';
 import { EMBEDDING_TABLE_NAME, EMBEDDING_INDEX_NAME } from '../../core/lbug/schema.js';
 import { PhaseTimer } from '../../core/search/phase-timer.js';
+import { checkStaleness, checkCwdMatch } from '../../core/git-staleness.js';
 // AI context generation is CLI-only (gitnexus analyze)
 // import { generateAIContextFiles } from '../../cli/ai-context.js';
 
@@ -197,6 +199,7 @@ interface RepoHandle {
   lbugPath: string;
   indexedAt: string;
   lastCommit: string;
+  remoteUrl?: string;
   stats?: RegistryEntry['stats'];
 }
 
@@ -207,6 +210,13 @@ export class LocalBackend {
   private reinitPromises: Map<string, Promise<void>> = new Map();
   private lastStalenessCheck: Map<string, number> = new Map();
   private groupToolSvc: GroupService | null = null;
+  /**
+   * One-shot stderr warnings for sibling-clone drift, keyed by
+   * `${repoId}|${cwdGitRoot}`. Without this guard every tool call
+   * from inside a sibling clone would print the same warning,
+   * making MCP stderr unreadable.
+   */
+  private warnedSiblingDrift: Set<string> = new Set();
 
   /**
    * Cross-repo group tools (CLI). Shares logic with MCP `group_*` handlers.
@@ -273,6 +283,7 @@ export class LocalBackend {
         lbugPath,
         indexedAt: entry.indexedAt,
         lastCommit: entry.lastCommit,
+        remoteUrl: entry.remoteUrl,
         stats: entry.stats,
       };
 
@@ -331,12 +342,26 @@ export class LocalBackend {
    */
   async resolveRepo(repoParam?: string): Promise<RepoHandle> {
     const result = this.resolveRepoFromCache(repoParam);
-    if (result) return result;
+    if (result) {
+      // Issue: silent graph drift across sibling clones.
+      // If the caller's cwd lives in a *different* on-disk clone of
+      // the same repo (matched by `remoteUrl`), warn once per
+      // (repo, cwd) pair on stderr. We do not fail or refuse to
+      // serve — the index is still the best answer we have — but
+      // the operator/agent has to know the answer may be stale.
+      this.maybeWarnSiblingDrift(result).catch(() => {
+        /* best-effort; never throw from resolveRepo */
+      });
+      return result;
+    }
 
     // Miss — refresh registry and try once more
     await this.refreshRepos();
     const retried = this.resolveRepoFromCache(repoParam);
-    if (retried) return retried;
+    if (retried) {
+      this.maybeWarnSiblingDrift(retried).catch(() => {});
+      return retried;
+    }
 
     // Still no match — throw with helpful message
     if (this.repos.size === 0) {
@@ -474,18 +499,94 @@ export class LocalBackend {
    * List all registered repos with their metadata.
    * Re-reads the global registry so newly indexed repos are discovered
    * without restarting the MCP server.
+   *
+   * Each entry includes:
+   *   - `staleness`: if the indexed clone's own HEAD has moved past
+   *     the recorded `lastCommit` (option D in the issue's fix list).
+   *   - `siblings`: other registered entries sharing the same
+   *     `remoteUrl` (option B's payoff: callers can see at a glance
+   *     that another clone of the same logical repo is registered).
+   *   - `remoteUrl`: the canonical origin URL recorded at index time.
    */
   async listRepos(): Promise<
-    Array<{ name: string; path: string; indexedAt: string; lastCommit: string; stats?: any }>
+    Array<{
+      name: string;
+      path: string;
+      indexedAt: string;
+      lastCommit: string;
+      remoteUrl?: string;
+      stats?: any;
+      staleness?: { commitsBehind: number; hint?: string };
+      siblings?: Array<{ name: string; path: string; lastCommit: string }>;
+    }>
   > {
     await this.refreshRepos();
-    return [...this.repos.values()].map((h) => ({
-      name: h.name,
-      path: h.repoPath,
-      indexedAt: h.indexedAt,
-      lastCommit: h.lastCommit,
-      stats: h.stats,
-    }));
+    const handles = [...this.repos.values()];
+    return Promise.all(
+      handles.map(async (h) => {
+        const stale = checkStaleness(h.repoPath, h.lastCommit);
+        const siblings = await findSiblingClones(h.remoteUrl, h.repoPath);
+        return {
+          name: h.name,
+          path: h.repoPath,
+          indexedAt: h.indexedAt,
+          lastCommit: h.lastCommit,
+          remoteUrl: h.remoteUrl,
+          stats: h.stats,
+          staleness: stale.isStale
+            ? { commitsBehind: stale.commitsBehind, hint: stale.hint }
+            : undefined,
+          siblings:
+            siblings.length > 0
+              ? siblings.map((s) => ({
+                  name: s.name,
+                  path: s.path,
+                  lastCommit: s.lastCommit,
+                }))
+              : undefined,
+        };
+      }),
+    );
+  }
+
+  /**
+   * Best-effort sibling-clone drift warning.
+   *
+   * When the resolved index has a `remoteUrl` recorded and the caller's
+   * `process.cwd()` is inside a *different* clone of the same repo, emit
+   * one stderr line per (repo, cwd) pair so the operator knows the
+   * graph may be stale relative to what's actually on disk under their
+   * cwd. Silent on path matches and on repos without a remote URL.
+   *
+   * Pure side-effect (stderr); never affects the returned handle.
+   */
+  private async maybeWarnSiblingDrift(handle: RepoHandle): Promise<void> {
+    if (!handle.remoteUrl) return;
+    let cwd: string;
+    try {
+      cwd = process.cwd();
+    } catch {
+      return;
+    }
+    const match = await checkCwdMatch(cwd);
+    if (
+      match.match !== 'sibling-by-remote' ||
+      !match.entry ||
+      !match.cwdGitRoot ||
+      match.entry.path !== handle.repoPath ||
+      !match.hint
+    ) {
+      return;
+    }
+    // Only warn when the sibling has actually drifted (or drift is
+    // unknown). If both clones are on the indexed commit, skip the
+    // noise — the caller is fine.
+    if (match.cwdHead && match.cwdHead === handle.lastCommit) return;
+
+    const key = `${handle.id}|${match.cwdGitRoot}`;
+    if (this.warnedSiblingDrift.has(key)) return;
+    this.warnedSiblingDrift.add(key);
+    console.error(`GitNexus: ${match.hint}`);
   }
 
   // ─── Tool Dispatch ───────────────────────────────────────────────
