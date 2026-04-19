@@ -5,11 +5,7 @@
 
 import { execFileSync } from 'node:child_process';
 import path from 'path';
-import {
-  readRegistry,
-  type RegistryEntry,
-  type CwdMatch,
-} from '../storage/repo-manager.js';
+import { readRegistry, type RegistryEntry, type CwdMatch } from '../storage/repo-manager.js';
 import { getGitRoot, getCurrentCommit, getRemoteUrl } from '../storage/git.js';
 
 export interface StalenessInfo {
@@ -54,15 +50,11 @@ export function checkStaleness(repoPath: string, lastCommit: string): StalenessI
 function commitsAheadOfIndexed(siblingPath: string, indexedCommit: string): number | undefined {
   if (!indexedCommit) return undefined;
   try {
-    const result = execFileSync(
-      'git',
-      ['rev-list', '--count', `${indexedCommit}..HEAD`],
-      {
-        cwd: siblingPath,
-        encoding: 'utf-8',
-        stdio: ['pipe', 'pipe', 'pipe'],
-      },
-    ).trim();
+    const result = execFileSync('git', ['rev-list', '--count', `${indexedCommit}..HEAD`], {
+      cwd: siblingPath,
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    }).trim();
     return parseInt(result, 10) || 0;
   } catch {
     return undefined;
@@ -117,7 +109,9 @@ export async function checkCwdMatch(cwd: string): Promise<CwdMatch> {
   const cwdRemote = getRemoteUrl(cwdGitRoot);
   if (!cwdRemote) return { match: 'none' };
 
-  const sibling = entries.find((e) => e.remoteUrl === cwdRemote && norm(e.path) !== norm(cwdGitRoot));
+  const sibling = entries.find(
+    (e) => e.remoteUrl === cwdRemote && norm(e.path) !== norm(cwdGitRoot),
+  );
   if (!sibling) return { match: 'none' };
 
   const cwdHead = getCurrentCommit(cwdGitRoot) || undefined;

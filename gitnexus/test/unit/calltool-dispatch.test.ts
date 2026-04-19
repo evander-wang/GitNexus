@@ -757,6 +757,45 @@ describe('LocalBackend.resolveRepo', () => {
     // listRegisteredRepos should have been called again
     expect(listRegisteredRepos).toHaveBeenCalledTimes(2); // once in init, once in refreshRepos
   });
+
+  it('emits sibling-clone drift warning exactly once per (repo, cwd) pair', async () => {
+    // Regression guard for the one-shot stderr warning emitted when
+    // the caller's cwd is in a sibling clone of the resolved index.
+    // The cache must short-circuit BOTH `console.error` and the
+    // underlying `checkCwdMatch` git shellouts on subsequent calls.
+    const { checkCwdMatch } = await import('../../src/core/git-staleness.js');
+    (listRegisteredRepos as any).mockResolvedValue([
+      { ...MOCK_REPO_ENTRY, remoteUrl: 'https://example.com/foo/bar' },
+    ]);
+    (checkCwdMatch as any).mockResolvedValue({
+      match: 'sibling-by-remote',
+      entry: { ...MOCK_REPO_ENTRY, remoteUrl: 'https://example.com/foo/bar' },
+      cwdGitRoot: '/tmp/sibling-clone',
+      cwdHead: 'feedface',
+      hint: '⚠️ stale sibling clone',
+    });
+
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await backend.init();
+
+      // Three resolveRepo invocations from the same cwd:
+      await backend.callTool('list_repos', {}); // resolveRepo not called for list_repos
+      // Use a real resolveRepo path:
+      await backend.resolveRepo();
+      await backend.resolveRepo();
+      await backend.resolveRepo();
+
+      const drift = errSpy.mock.calls.filter((c) => String(c[0]).includes('stale sibling clone'));
+      expect(drift).toHaveLength(1);
+      // checkCwdMatch should also only run once — the cache check
+      // happens BEFORE the shellout-heavy match call.
+      expect(checkCwdMatch).toHaveBeenCalledTimes(1);
+    } finally {
+      errSpy.mockRestore();
+      (checkCwdMatch as any).mockResolvedValue({ match: 'none' });
+    }
+  });
 });
 
 // ─── getContext ──────────────────────────────────────────────────────

@@ -16,7 +16,7 @@
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import path from 'path';
-import fs from 'fs/promises';
+import fs from 'fs';
 import { execSync } from 'child_process';
 import {
   registerRepo,
@@ -199,8 +199,12 @@ describe('checkCwdMatch', () => {
 
       const m = await checkCwdMatch(sibling.dbPath);
       expect(m.match).toBe('sibling-by-remote');
+      // `git rev-parse --show-toplevel` returns the realpath of the
+      // worktree, which on macOS resolves the `/var → /private/var`
+      // symlink and on Windows expands short 8.3 names. Compare
+      // against `fs.realpathSync` so the assertion is portable.
       expect(m.entry?.path).toBe(path.resolve(indexed.dbPath));
-      expect(m.cwdGitRoot).toBe(path.resolve(sibling.dbPath));
+      expect(m.cwdGitRoot).toBe(fs.realpathSync(sibling.dbPath));
       expect(m.hint).toBeTruthy();
     } finally {
       await indexed.cleanup();
