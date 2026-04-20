@@ -64,6 +64,7 @@ export const contentHashForNode = (
   // Hash must be deterministic across runs, so exclude methodNames/fieldNames
   // which are populated during the batch loop via AST extraction.
   // Using only node.content ensures the hash stays stable.
+  // NOTE: A change to extractStructuralNames behavior requires bumping EMBEDDING_TEXT_VERSION.
   const text = generateEmbeddingText(
     { ...node, methodNames: undefined, fieldNames: undefined },
     node.content,

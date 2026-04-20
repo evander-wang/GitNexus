@@ -66,7 +66,7 @@ describe('contentHashForNode', () => {
   });
 
   it('exports a text template version marker', () => {
-    expect(EMBEDDING_TEXT_VERSION).toBeTruthy();
+    expect(EMBEDDING_TEXT_VERSION).toBe('v2');
   });
 });
 

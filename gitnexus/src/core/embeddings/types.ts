@@ -27,6 +27,8 @@ export const LABEL_CODE_ELEMENT = 'CodeElement' as const;
 
 export const CHUNK_MODE_AST_FUNCTION = 'ast-function' as const;
 export const CHUNK_MODE_AST_DECLARATION = 'ast-declaration' as const;
+// CHUNK_MODE_CHARACTER exists for type completeness but is a no-op in CHUNKING_RULES —
+// omit the entry entirely to get character fallback via chunker.ts dispatch.
 export const CHUNK_MODE_CHARACTER = 'character' as const;
 
 export const STRUCTURAL_TEXT_MODE_NONE = 'none' as const;
@@ -100,13 +102,14 @@ export const isShortLabel = (label: string): boolean =>
   (SHORT_LABELS as readonly string[]).includes(label);
 
 /**
- * Node labels that have structural names (methods/fields) extractable via AST
+ * Node labels that have structural names (methods/fields) extractable via AST.
+ * Only labels that consume methodNames/fieldNames in their embedding text should
+ * be listed here — extra entries trigger wasted AST parses with no effect on output.
  */
 export const STRUCTURAL_LABELS: ReadonlySet<string> = new Set([
   LABEL_CLASS,
   LABEL_STRUCT,
   LABEL_INTERFACE,
-  LABEL_ENUM,
 ]);
 
 /**
