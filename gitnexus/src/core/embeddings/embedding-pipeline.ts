@@ -30,6 +30,7 @@ import {
   DEFAULT_EMBEDDING_CONFIG,
   EMBEDDABLE_LABELS,
   isShortLabel,
+  LABEL_METHOD,
   LABELS_WITH_EXPORTED,
   STRUCTURAL_LABELS,
   collectBestChunks,
@@ -43,6 +44,12 @@ import {
 import { loadVectorExtension } from '../lbug/lbug-adapter.js';
 
 const isDev = process.env.NODE_ENV === 'development';
+/**
+ * Bump this when the embedding text template changes in a way that should
+ * invalidate existing vectors, such as metadata/header shape changes,
+ * structural container context changes, or preceding-context formatting rules.
+ */
+export const EMBEDDING_TEXT_VERSION = 'v2';
 
 /**
  * Compute a stable content fingerprint for an embeddable node.
@@ -62,7 +69,7 @@ export const contentHashForNode = (
     node.content,
     config,
   );
-  return createHash('sha1').update(text).digest('hex');
+  return createHash('sha1').update(EMBEDDING_TEXT_VERSION).update('\n').update(text).digest('hex');
 };
 
 /**
@@ -83,7 +90,7 @@ const queryEmbeddableNodes = async (
     try {
       let query: string;
 
-      if (label === 'Method') {
+      if (label === LABEL_METHOD) {
         // Method has parameterCount and returnType
         query = `
           MATCH (n:Method)
@@ -115,7 +122,7 @@ const queryEmbeddableNodes = async (
 
       const rows = await executeQuery(query);
       for (const row of rows) {
-        const hasExportedColumn = label === 'Method' || LABELS_WITH_EXPORTED.has(label);
+        const hasExportedColumn = label === LABEL_METHOD || LABELS_WITH_EXPORTED.has(label);
         allNodes.push({
           id: row.id ?? row[0],
           name: row.name ?? row[1],
@@ -126,7 +133,7 @@ const queryEmbeddableNodes = async (
           endLine: row.endLine ?? row[6],
           isExported: hasExportedColumn ? (row.isExported ?? row[7]) : undefined,
           description: row.description ?? (hasExportedColumn ? row[8] : row[7]),
-          ...(label === 'Method'
+          ...(label === LABEL_METHOD
             ? {
                 parameterCount: row.parameterCount ?? row[9],
                 returnType: row.returnType ?? row[10],
@@ -415,8 +422,15 @@ export const runEmbeddingPipeline = async (
           }
         }
 
+        let prevTail = '';
         for (const chunk of chunks) {
-          const text = generateEmbeddingText(node, chunk.text, finalConfig);
+          const text = generateEmbeddingText(
+            node,
+            chunk.text,
+            finalConfig,
+            chunk.chunkIndex,
+            prevTail,
+          );
           allTexts.push(text);
           allUpdates.push({
             nodeId: node.id,
@@ -425,6 +439,7 @@ export const runEmbeddingPipeline = async (
             endLine: chunk.endLine,
             contentHash: hash,
           });
+          prevTail = overlap > 0 ? chunk.text.slice(-overlap) : '';
         }
       }
 
