@@ -84,6 +84,15 @@ program
   .action(createLazyAction(() => import('./clean.js'), 'cleanCommand'));
 
 program
+  .command('remove <target>')
+  .description(
+    'Delete the GitNexus index for a registered repo (by alias, name, or absolute path). ' +
+      'Unlike `clean`, does not require being inside the repo. Idempotent on unknown targets.',
+  )
+  .option('-f, --force', 'Skip confirmation prompt')
+  .action(createLazyAction(() => import('./remove.js'), 'removeCommand'));
+
+program
   .command('wiki [path]')
   .description('Generate repository wiki from knowledge graph')
   .option('-f, --force', 'Force full regeneration even if up to date')
@@ -150,6 +159,15 @@ program
   .description('Execute raw Cypher query against the knowledge graph')
   .option('-r, --repo <name>', 'Target repository')
   .action(createLazyAction(() => import('./tool.js'), 'cypherCommand'));
+
+program
+  .command('detect-changes')
+  .alias('detect_changes')
+  .description('Map git diff hunks to indexed symbols and affected execution flows')
+  .option('-s, --scope <scope>', 'What to analyze: unstaged, staged, all, or compare', 'unstaged')
+  .option('-b, --base-ref <ref>', 'Branch/commit for compare scope (e.g. main)')
+  .option('-r, --repo <name>', 'Target repository')
+  .action(createLazyAction(() => import('./tool.js'), 'detectChangesCommand'));
 
 // ─── Eval Server (persistent daemon for SWE-bench) ─────────────────
 
