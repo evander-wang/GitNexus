@@ -204,7 +204,7 @@ describe('checkCwdMatch', () => {
       // symlink and on Windows expands short 8.3 names. Compare
       // against `fs.realpathSync` so the assertion is portable.
       expect(m.entry?.path).toBe(path.resolve(indexed.dbPath));
-      expect(m.cwdGitRoot).toBe(fs.realpathSync(sibling.dbPath));
+      expect(fs.realpathSync(m.cwdGitRoot!)).toBe(fs.realpathSync(sibling.dbPath));
       expect(m.hint).toBeTruthy();
     } finally {
       await indexed.cleanup();
