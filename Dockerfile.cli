@@ -15,6 +15,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends python3 make g+
 COPY gitnexus-shared/package.json gitnexus-shared/package-lock.json ./gitnexus-shared/
 RUN npm ci --prefix gitnexus-shared
 COPY gitnexus-shared ./gitnexus-shared
+RUN rm -f gitnexus-shared/tsconfig.tsbuildinfo
 RUN npm run build --prefix gitnexus-shared
 
 # Copy the full gitnexus package before installing — `npm ci` triggers
@@ -29,6 +30,14 @@ RUN npm prune --omit=dev --prefix gitnexus
 
 # ── Runtime ────────────────────────────────────────────────────────────
 FROM node:22-slim AS runtime
+
+# @ladybugdb/core needs GLIBCXX_3.4.31 (GCC 13+); Bookworm only ships 3.4.30.
+# Pull libstdc++6 from Debian Trixie, then remove the source list so later
+# packages (curl, git) still come from stable Bookworm.
+RUN echo "deb http://deb.debian.org/debian trixie main" > /etc/apt/sources.list.d/trixie.list && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends -t trixie libstdc++6 && \
+    rm /etc/apt/sources.list.d/trixie.list
 
 # curl for the healthcheck; git so `gitnexus` can clone repos at runtime.
 RUN apt-get update && apt-get install -y --no-install-recommends curl git && rm -rf /var/lib/apt/lists/*
