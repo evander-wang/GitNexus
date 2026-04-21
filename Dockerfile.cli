@@ -4,7 +4,7 @@ ARG TARGETPLATFORM
 # ── Builder ────────────────────────────────────────────────────────────
 # Native modules (tree-sitter-*, onnxruntime-node, node-gyp builds for
 # tree-sitter-proto / tree-sitter-swift) require python3 + a C/C++ toolchain.
-FROM node:22-slim AS builder
+FROM node:22-trixie-slim AS builder
 
 WORKDIR /app
 
@@ -29,15 +29,7 @@ RUN npm ci --prefix gitnexus
 RUN npm prune --omit=dev --prefix gitnexus
 
 # ── Runtime ────────────────────────────────────────────────────────────
-FROM node:22-slim AS runtime
-
-# @ladybugdb/core needs GLIBCXX_3.4.31 (GCC 13+); Bookworm only ships 3.4.30.
-# Pull libstdc++6 from Debian Trixie, then remove the source list so later
-# packages (curl, git) still come from stable Bookworm.
-RUN echo "deb http://deb.debian.org/debian trixie main" > /etc/apt/sources.list.d/trixie.list && \
-    apt-get update && \
-    apt-get install -y --no-install-recommends -t trixie libstdc++6 && \
-    rm /etc/apt/sources.list.d/trixie.list
+FROM node:22-trixie-slim AS runtime
 
 # curl for the healthcheck; git so `gitnexus` can clone repos at runtime.
 RUN apt-get update && apt-get install -y --no-install-recommends curl git && rm -rf /var/lib/apt/lists/*
