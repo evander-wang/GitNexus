@@ -349,7 +349,10 @@ const findEnclosingFunction = (
           if (resolved.candidates.length === 1) {
             return resolved.candidates[0].nodeId;
           }
-          const classInfo = findEnclosingClassInfo(current, filePath);
+          const classInfo = findEnclosingClassInfo(
+            current.childForFieldName?.('name') ?? current,
+            filePath,
+          );
           if (classInfo) {
             const classMatches = resolved.candidates.filter((c) => c.ownerId === classInfo.classId);
             // Unique class match — return it (no same-arity ambiguity)
@@ -373,7 +376,10 @@ const findEnclosingFunction = (
           const override = provider.labelOverride(current, label);
           if (override !== null) finalLabel = override;
         }
-        const classInfo2 = findEnclosingClassInfo(current, filePath);
+        const classInfo2 = findEnclosingClassInfo(
+          current.childForFieldName?.('name') ?? current,
+          filePath,
+        );
         const qualifiedName = classInfo2 ? `${classInfo2.className}.${funcName}` : funcName;
         // Include #<arity> and ~typeTag suffix to match definition-phase Method/Constructor IDs.
         const language = getLanguageFromFilename(filePath);
