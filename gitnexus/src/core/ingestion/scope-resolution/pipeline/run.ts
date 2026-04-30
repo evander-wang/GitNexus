@@ -149,6 +149,8 @@ export function runScopeResolution(
     hooks: {
       resolveImportTarget: (targetRaw, fromFile) =>
         provider.resolveImportTarget(targetRaw, fromFile, allFilePaths, resolutionConfig),
+      expandsWildcardTo: (targetModuleScope) =>
+        provider.expandsWildcardTo?.(targetModuleScope, parsedFiles) ?? [],
       mergeBindings: (existing, incoming, scopeId) =>
         provider.mergeBindings(existing, incoming, scopeId),
     },
@@ -177,11 +179,18 @@ export function runScopeResolution(
   // class bindings when chasing return-type chains across files.
   // The hook writes to `bindingAugmentations` only; finalized
   // `indexes.bindings` remains immutable post-finalize (I8).
+  let fileContents: Map<string, string> | undefined;
+  const getFileContents = (): Map<string, string> => {
+    if (fileContents === undefined) {
+      fileContents = new Map<string, string>();
+      for (const f of files) fileContents.set(f.path, f.content);
+    }
+    return fileContents;
+  };
+
   if (provider.populateNamespaceSiblings !== undefined) {
-    const fileContents = new Map<string, string>();
-    for (const f of files) fileContents.set(f.path, f.content);
     provider.populateNamespaceSiblings(parsedFiles, indexes, {
-      fileContents,
+      fileContents: getFileContents(),
       treeCache,
     });
   }
@@ -195,6 +204,12 @@ export function runScopeResolution(
   // here, not in finalize).
   if (provider.propagatesReturnTypesAcrossImports !== false) {
     propagateImportedReturnTypes(parsedFiles, indexes, workspaceIndex);
+  }
+
+  if (provider.populateRangeBindings !== undefined) {
+    provider.populateRangeBindings(parsedFiles, indexes, {
+      fileContents: getFileContents(),
+    });
   }
   const tPropagate = PROF ? process.hrtime.bigint() : 0n;
 
@@ -237,6 +252,7 @@ export function runScopeResolution(
     handledSites,
     readonlyModel,
     workspaceIndex,
+    { allowGlobalFallback: provider.allowGlobalFreeCallFallback === true },
   );
   const { emitted, skipped } = emitReferencesViaLookup(
     graph,

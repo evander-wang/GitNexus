@@ -93,7 +93,7 @@ export interface FinalizeHooks {
     targetRaw: string,
     fromFile: string,
     workspaceIndex: WorkspaceIndex,
-  ): string | null;
+  ): string | readonly string[] | null;
 
   /**
    * For a wildcard `import * from M`, return the names visible in the
@@ -179,9 +179,9 @@ export function finalize(input: FinalizeInput, hooks: FinalizeHooks): FinalizeOu
   for (const file of input.files) {
     const drafts: ImportEdgeDraft[] = [];
     for (const parsed of file.parsedImports) {
-      const draft = makeEdgeDraft(parsed, file, hooks, input.workspaceIndex);
-      drafts.push(draft);
-      totalEdges++;
+      const draftArray = makeEdgeDrafts(parsed, file, hooks, input.workspaceIndex);
+      drafts.push(...draftArray);
+      totalEdges += draftArray.length;
     }
     edgeIndex.set(file.filePath, drafts);
   }
@@ -320,12 +320,12 @@ interface ImportEdgeDraft {
   finalized: ImportEdge | null;
 }
 
-function makeEdgeDraft(
+function makeEdgeDrafts(
   parsed: ParsedImport,
   file: FinalizeFile,
   hooks: FinalizeHooks,
   workspace: WorkspaceIndex,
-): ImportEdgeDraft {
+): ImportEdgeDraft[] {
   // Dynamic-unresolved passes through — no `BindingRef`, no target file.
   if (parsed.kind === 'dynamic-unresolved') {
     const base: ImportEdge = {
@@ -334,14 +334,16 @@ function makeEdgeDraft(
       targetExportedName: '',
       kind: 'dynamic-unresolved',
     };
-    return {
-      source: parsed,
-      fromFile: file.filePath,
-      fromScope: file.moduleScope,
-      targetFile: null,
-      base,
-      finalized: base, // already fully finalized
-    };
+    return [
+      {
+        source: parsed,
+        fromFile: file.filePath,
+        fromScope: file.moduleScope,
+        targetFile: null,
+        base,
+        finalized: base, // already fully finalized
+      },
+    ];
   }
 
   const targetFile = hooks.resolveImportTarget(parsed.targetRaw ?? '', file.filePath, workspace);
@@ -355,14 +357,16 @@ function makeEdgeDraft(
       kind: edgeKindFor(parsed),
       linkStatus: 'unresolved',
     };
-    return {
-      source: parsed,
-      fromFile: file.filePath,
-      fromScope: file.moduleScope,
-      targetFile: null,
-      base,
-      finalized: base,
-    };
+    return [
+      {
+        source: parsed,
+        fromFile: file.filePath,
+        fromScope: file.moduleScope,
+        targetFile: null,
+        base,
+        finalized: base,
+      },
+    ];
   }
 
   // Resolvable at the file level; intra-SCC fixpoint may still fail to fill
@@ -370,21 +374,24 @@ function makeEdgeDraft(
   // and resolved-dynamic imports are terminal at the file level — no
   // `targetDefId` needed since they materialize no `BindingRef`. Pre-
   // finalize them here so the fixpoint loop skips them entirely.
-  const base: ImportEdge = {
-    localName: extractLocalName(parsed),
-    targetFile,
-    targetExportedName: extractExportedName(parsed),
-    kind: edgeKindFor(parsed),
-  };
+  const targetFiles = Array.isArray(targetFile) ? targetFile : [targetFile];
   const isFileLevelTerminal = parsed.kind === 'side-effect' || parsed.kind === 'dynamic-resolved';
-  return {
-    source: parsed,
-    fromFile: file.filePath,
-    fromScope: file.moduleScope,
-    targetFile,
-    base,
-    finalized: isFileLevelTerminal ? base : null,
-  };
+  return targetFiles.map((tf) => {
+    const base: ImportEdge = {
+      localName: extractLocalName(parsed),
+      targetFile: tf,
+      targetExportedName: extractExportedName(parsed),
+      kind: edgeKindFor(parsed),
+    };
+    return {
+      source: parsed,
+      fromFile: file.filePath,
+      fromScope: file.moduleScope,
+      targetFile: tf,
+      base,
+      finalized: isFileLevelTerminal ? base : null,
+    };
+  });
 }
 
 function edgeKindFor(parsed: ParsedImport): ImportEdge['kind'] {

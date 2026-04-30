@@ -1,0 +1,101 @@
+import type { ParsedFile, Scope, TypeRef } from 'gitnexus-shared';
+import type { ScopeResolutionIndexes } from '../../model/scope-resolution-indexes.js';
+import { getGoParser } from './query.js';
+
+export function populateGoRangeBindings(
+  parsedFiles: readonly ParsedFile[],
+  _indexes: ScopeResolutionIndexes,
+  ctx: { readonly fileContents: ReadonlyMap<string, string> },
+): void {
+  const parser = getGoParser();
+
+  for (const parsed of parsedFiles) {
+    const sourceText = ctx.fileContents.get(parsed.filePath);
+    if (sourceText === undefined) continue;
+
+    const tree = parser.parse(sourceText);
+    const moduleScope = parsed.scopes.find((s) => s.kind === 'Module');
+    if (moduleScope === undefined) continue;
+
+    const scopeMap = new Map(parsed.scopes.map((s) => [s.id, s]));
+
+    for (const rangeNode of tree.rootNode.descendantsOfType('for_statement')) {
+      const rangeClause = rangeNode.namedChildren.find((c) => c.type === 'range_clause');
+      if (rangeClause === null) continue;
+
+      const left = rangeClause.namedChildren.find((c) => c.type === 'expression_list');
+      if (left === null) continue;
+
+      const rangeExpr = rangeClause.namedChildren.find(
+        (c, idx) => c.type !== 'expression_list' && idx > rangeClause.namedChildren.indexOf(left),
+      );
+      if (rangeExpr === undefined) continue;
+
+      // Identify the value variable (skip the `_` discard if present)
+      const idents = left.namedChildren.filter((c) => c.type === 'identifier');
+      let valueVar: string | null = null;
+      if (idents.length >= 2) {
+        valueVar = idents[1].text; // for _, v := range ...
+      } else if (idents.length === 1) {
+        valueVar = idents[0].text; // for v := range ...
+      }
+
+      if (valueVar === null || valueVar === '_') continue;
+
+      // Resolve range expression type
+      let elementType: string | null = null;
+
+      if (rangeExpr.type === 'identifier') {
+        // Look up the identifier's type in scope typeBindings (V1: module scope only)
+        const binding = moduleScope.typeBindings.get(rangeExpr.text);
+        if (binding !== null && binding !== undefined) {
+          elementType = extractElementType(binding);
+        }
+      } else if (rangeExpr.type === 'call_expression') {
+        const fnNode = rangeExpr.childForFieldName('function');
+        if (fnNode !== null) {
+          const fnName =
+            fnNode.type === 'selector_expression'
+              ? fnNode.childForFieldName('field')?.text
+              : fnNode.text;
+          if (fnName !== undefined) {
+            const binding = moduleScope.typeBindings.get(fnName);
+            if (binding !== null && binding !== undefined) {
+              elementType = extractElementType(binding);
+            }
+          }
+        }
+      }
+
+      if (elementType !== null && valueVar !== null) {
+        // Inject type binding for the range variable onto the enclosing function scope
+        const functionScope = findEnclosingFunctionScope(rangeNode, scopeMap);
+        const targetScope = functionScope ?? moduleScope;
+        const mutable = targetScope.typeBindings as Map<string, TypeRef>;
+        mutable.set(valueVar, {
+          rawName: elementType,
+          declaredAtScope: targetScope.id,
+          source: 'annotation',
+        });
+      }
+    }
+  }
+}
+
+function extractElementType(binding: TypeRef): string | null {
+  const raw = binding.rawName;
+  const mapMatch = raw.match(/^map\[[^\]]+\]\s*(.+)$/);
+  if (mapMatch) return mapMatch[1].trim();
+  if (raw.startsWith('[]')) return raw.slice(2).trim();
+  const arrMatch = raw.match(/^\[\d+\](.+)$/);
+  if (arrMatch) return arrMatch[1].trim();
+  return raw;
+}
+
+function findEnclosingFunctionScope(
+  _node: unknown,
+  _scopeMap: ReadonlyMap<string, Scope>,
+): Scope | null {
+  // V1 simplified: return null, use module scope as fallback
+  return null;
+}
