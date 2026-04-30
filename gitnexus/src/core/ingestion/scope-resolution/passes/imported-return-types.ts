@@ -196,6 +196,55 @@ export function propagateImportedReturnTypes(
     }
   }
 
+  // Namespace-import mirroring: for languages with namespace-style
+  // imports (Go `import "pkg"`), mirror exported typeBindings from all
+  // target files' module scopes into the importer's module scope. This
+  // covers the cross-package case where `x := pkg.Func()` creates a
+  // function-scope typeBinding `x → Func`, and the module-scope chain-
+  // follow needs `Func → ReturnType` to exist in the importer's scope
+  // chain. Without this, only same-file constructor-inferred resolution
+  // works.
+  for (const parsed of parsedFiles) {
+    const importerModule = moduleScopeByFile.get(parsed.filePath);
+    if (importerModule === undefined) continue;
+
+    const moduleEdges = indexes.imports.get(importerModule.id);
+    if (moduleEdges === undefined) continue;
+
+    // Collect namespace target files per localName (one namespace may
+    // expand to multiple files — e.g. Go multi-file packages).
+    const nsTargets = new Map<string, string[]>();
+    for (const edge of moduleEdges) {
+      if (edge.kind !== 'namespace' || edge.targetFile === null) continue;
+      let targets = nsTargets.get(edge.localName);
+      if (targets === undefined) {
+        targets = [];
+        nsTargets.set(edge.localName, targets);
+      }
+      if (!targets.includes(edge.targetFile)) targets.push(edge.targetFile);
+    }
+
+    for (const targetFiles of nsTargets.values()) {
+      for (const targetFile of targetFiles) {
+        const sourceModule = moduleScopeByFile.get(targetFile);
+        if (sourceModule === undefined) continue;
+
+        for (const [name, ref] of sourceModule.typeBindings) {
+          // Only mirror exported names (uppercase first char — Go
+          // convention; other languages using namespace imports
+          // typically export everything, so this filter is harmless).
+          if (name.length === 0) continue;
+          const first = name[0]!;
+          if (first < 'A' || first > 'Z') continue;
+          if (importerModule.typeBindings.has(name)) continue;
+
+          const terminal = followChainPostFinalize(ref, sourceModule.id, indexes);
+          (importerModule.typeBindings as Map<string, TypeRef>).set(name, terminal);
+        }
+      }
+    }
+  }
+
   // Final pass: chain-follow non-module scopes (function-local
   // typeBindings). Module scopes were already followed inside the
   // SCC loop above.
