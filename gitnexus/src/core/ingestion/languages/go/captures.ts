@@ -8,6 +8,31 @@ import { synthesizeGoReceiverBinding } from './receiver-binding.js';
 import { synthesizeGoTypeBindings } from './type-binding.js';
 import { getTreeSitterBufferSize } from '../../constants.js';
 
+/** Go builtin types that must not be qualified with a package prefix. */
+const GO_BUILTIN_TYPES = new Set([
+  'bool',
+  'byte',
+  'complex128',
+  'complex64',
+  'error',
+  'float32',
+  'float64',
+  'int',
+  'int16',
+  'int32',
+  'int64',
+  'int8',
+  'rune',
+  'string',
+  'uint',
+  'uint16',
+  'uint32',
+  'uint64',
+  'uint8',
+  'uintptr',
+  'any',
+]);
+
 function inferPackageName(sourceText: string): string | null {
   const match = sourceText.match(/^\s*package\s+([A-Za-z_][A-Za-z0-9_]*)/m);
   return match?.[1] ?? null;
@@ -155,8 +180,8 @@ export function emitGoScopeCaptures(
       let raw = typeCap.text.trim();
       while (raw.startsWith('*')) raw = raw.slice(1).trim();
       if (raw.startsWith('[]')) raw = raw.slice(2).trim();
-      // Not a builtin or generic — safe to qualify.
       if (raw.includes('.') || raw.startsWith('func(') || raw.startsWith('map[')) continue;
+      if (GO_BUILTIN_TYPES.has(raw)) continue;
       const idx = raw.indexOf('[');
       if (idx !== -1) raw = raw.slice(0, idx);
       out[i] = {
