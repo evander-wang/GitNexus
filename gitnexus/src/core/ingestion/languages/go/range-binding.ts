@@ -96,6 +96,7 @@ function findEnclosingFunctionScope(
   _node: unknown,
   _scopeMap: ReadonlyMap<string, Scope>,
 ): Scope | null {
-  // V1 simplified: return null, use module scope as fallback
+  // V1 simplified: return null, use module scope as fallback.
+  // TODO(#1239): walk up tree-sitter AST to find enclosing func/method declaration.
   return null;
 }

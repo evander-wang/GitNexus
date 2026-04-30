@@ -127,20 +127,22 @@ export interface FinalizedScc {
 /**
  * Counters reported by `finalize`.
  *
- * **Counting granularity** — all edge counters are **per-`ParsedImport`**,
- * not per-materialized-`ImportEdge`. A single `wildcard` ParsedImport that
- * expands to N exports counts as one linked edge in these stats; the
- * materialized output (`FinalizeOutput.imports`) will have N edges for
- * that input. `dynamic-unresolved` ParsedImports count as linked (they
- * pass through with no `linkStatus`), so `linkedEdges` ≠ "has a
+ * **Counting granularity** — `totalEdges` is **per-generated-`ImportEdgeDraft`**,
+ * which may exceed the number of `ParsedImport` records when
+ * `resolveImportTarget` returns a multi-file array (e.g. Go package-scoped
+ * imports fan out to every `.go` file in the target directory). A single
+ * `wildcard` ParsedImport that expands to N exports also counts as one
+ * linked edge here; the materialized output (`FinalizeOutput.imports`) will
+ * have N edges for that input. `dynamic-unresolved` ParsedImports count as
+ * linked (they pass through with no `linkStatus`), so `linkedEdges` ≠ "has a
  * BindingRef" — use the `bindings` map for that.
  *
- * In other words: `totalEdges === input.parsedImports.length` summed
+ * In other words: `totalEdges >= input.parsedImports.length` summed
  * across files, and `linkedEdges + unresolvedEdges === totalEdges`.
  */
 export interface FinalizeStats {
   readonly totalFiles: number;
-  /** Total `ParsedImport` records seen across all files. */
+  /** Total `ImportEdgeDraft` records generated (≥ ParsedImport count). */
   readonly totalEdges: number;
   /**
    * `ParsedImport`s whose finalized edge does NOT carry
