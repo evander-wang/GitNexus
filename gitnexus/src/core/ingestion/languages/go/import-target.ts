@@ -37,10 +37,12 @@ export function resolveGoImportTarget(
     if (files.length > 0) return files;
   }
 
-  // 2) Non-go.mod / GOPATH: progressively shorter directory suffixes
-  //    "github.com/xxx/yyy/pkg" → try "github.com/xxx/yyy/pkg/" → "xxx/yyy/pkg/" → "yyy/pkg/" → "pkg/"
+  // 2) Non-go.mod / GOPATH: progressively shorter directory suffixes.
+  //    "github.com/xxx/yyy/pkg" → try "github.com/xxx/yyy/pkg/" → "xxx/yyy/pkg/" → "yyy/pkg/"
+  // Stop at ≥2 segments to avoid matching a single-segment suffix (e.g.
+  // "pkg", "util", "internal") to a local directory with the same name.
   const parts = targetRaw.split('/').filter(Boolean);
-  for (let i = 0; i < parts.length; i++) {
+  for (let i = 0; i < parts.length - 1; i++) {
     const files = findAllFilesInPkgDir(allFilePaths, parts.slice(i).join('/'));
     if (files.length > 0) return files;
   }
