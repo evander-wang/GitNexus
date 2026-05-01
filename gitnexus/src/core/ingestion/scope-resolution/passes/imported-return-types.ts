@@ -230,9 +230,11 @@ export function propagateImportedReturnTypes(
         if (sourceModule === undefined) continue;
 
         for (const [name, ref] of sourceModule.typeBindings) {
-          // Only mirror exported names (uppercase first char — Go
-          // convention; other languages using namespace imports
-          // typically export everything, so this filter is harmless).
+          // Only mirror exported names (uppercase first char —
+          // languages with namespace imports commonly use this
+          // convention for exported-symbol visibility; other
+          // languages without namespace imports are unaffected
+          // because this block only runs when nsTargets is populated).
           if (name.length === 0) continue;
           const first = name[0]!;
           if (first < 'A' || first > 'Z') continue;
