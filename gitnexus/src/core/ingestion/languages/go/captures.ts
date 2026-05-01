@@ -180,7 +180,9 @@ export function emitGoScopeCaptures(
       let raw = typeCap.text.trim();
       while (raw.startsWith('*')) raw = raw.slice(1).trim();
       if (raw.startsWith('[]')) raw = raw.slice(2).trim();
+      if (raw.startsWith('chan ')) raw = raw.slice(5).trim();
       if (raw.includes('.') || raw.startsWith('func(') || raw.startsWith('map[')) continue;
+      if (raw.startsWith('chan ')) continue;
       if (GO_BUILTIN_TYPES.has(raw)) continue;
       const idx = raw.indexOf('[');
       if (idx !== -1) raw = raw.slice(0, idx);

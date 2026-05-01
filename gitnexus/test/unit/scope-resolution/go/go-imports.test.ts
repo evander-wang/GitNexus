@@ -111,4 +111,45 @@ describe('Go import target resolution', () => {
 
     expect(result).toEqual(['extra.go', 'root.go']);
   });
+
+  it('resolves sub-package imports under module root', () => {
+    const result = resolveGoImportTarget(
+      'example.com/lib/internal/models',
+      'cmd/app/main.go',
+      new Set(['internal/models/user.go', 'internal/models/repo.go', 'root.go']),
+      { modulePath: 'example.com/lib' },
+    );
+
+    expect(Array.isArray(result)).toBe(true);
+    expect((result as string[]).sort()).toEqual([
+      'internal/models/repo.go',
+      'internal/models/user.go',
+    ]);
+  });
+
+  it('rejects single-segment GOPATH suffix that collides with a local dir', () => {
+    // "github.com/other/team/pkg" suffix-stripped would eventually
+    // reach "pkg" which matches the local pkg/ dir — but we require
+    // ≥2 segments in the GOPATH fallback, so it must not resolve.
+    const result = resolveGoImportTarget(
+      'github.com/other/team/pkg',
+      'main.go',
+      new Set(['pkg/util.go', 'main.go']),
+    );
+
+    expect(result).toBeNull();
+  });
+
+  it('resolves multi-segment GOPATH suffix that matches local dir', () => {
+    // "github.com/other/team/pkg" where "team/pkg/" exists locally
+    // — the 2-segment suffix "team/pkg" should still resolve.
+    const result = resolveGoImportTarget(
+      'github.com/other/team/pkg',
+      'main.go',
+      new Set(['team/pkg/util.go', 'main.go']),
+    );
+
+    expect(Array.isArray(result)).toBe(true);
+    expect(result as string[]).toEqual(['team/pkg/util.go']);
+  });
 });
