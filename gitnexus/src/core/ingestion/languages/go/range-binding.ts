@@ -93,10 +93,32 @@ function extractElementType(binding: TypeRef): string | null {
 }
 
 function findEnclosingFunctionScope(
-  _node: unknown,
-  _scopeMap: ReadonlyMap<string, Scope>,
+  node: unknown,
+  scopeMap: ReadonlyMap<string, Scope>,
 ): Scope | null {
-  // V1 simplified: return null, use module scope as fallback.
-  // TODO(#1239): walk up tree-sitter AST to find enclosing func/method declaration.
+  const tsNode = node as {
+    readonly parent: unknown;
+    readonly type: string;
+    readonly startPosition: { readonly row: number; readonly column: number };
+  };
+  // Walk up the AST to find the enclosing function or method declaration.
+  let current: typeof tsNode | null = tsNode;
+  while (current !== null) {
+    if (current.type === 'function_declaration' || current.type === 'method_declaration') {
+      // Match by source position: the scope whose range starts at the
+      // same line/column as the tree-sitter node.
+      for (const scope of scopeMap.values()) {
+        if (
+          scope.kind === 'Function' &&
+          scope.range.startLine === current.startPosition.row &&
+          scope.range.startCol === current.startPosition.column
+        ) {
+          return scope;
+        }
+      }
+      break;
+    }
+    current = (current.parent as typeof tsNode) ?? null;
+  }
   return null;
 }
