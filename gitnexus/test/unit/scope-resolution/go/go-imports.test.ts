@@ -82,10 +82,9 @@ describe('Go import interpretation', () => {
       '@import.source': capt('@import.source', 'example.com/pkg/util'),
     });
     expect(result).toEqual({
-      kind: 'alias',
+      kind: 'namespace',
       localName: 'util',
       importedName: 'util',
-      alias: 'util',
       targetRaw: 'example.com/pkg/util',
     });
   });

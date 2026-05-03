@@ -1,5 +1,10 @@
 import type { Capture, CaptureMatch } from 'gitnexus-shared';
-import { findNodeAtRange, nodeToCapture, syntheticCapture } from '../../utils/ast-helpers.js';
+import {
+  findNodeAtRange,
+  nodeToCapture,
+  syntheticCapture,
+  type SyntaxNode,
+} from '../../utils/ast-helpers.js';
 import { getGoParser, getGoScopeQuery } from './query.js';
 import { recordGoCacheHit, recordGoCacheMiss } from './cache-stats.js';
 import { computeGoCallArity, computeGoDeclarationArity } from './arity-metadata.js';
@@ -7,37 +12,6 @@ import { splitGoImportStatement } from './import-decomposer.js';
 import { synthesizeGoReceiverBinding } from './receiver-binding.js';
 import { synthesizeGoTypeBindings } from './type-binding.js';
 import { getTreeSitterBufferSize } from '../../constants.js';
-
-/** Go builtin types that must not be qualified with a package prefix. */
-const GO_BUILTIN_TYPES = new Set([
-  'bool',
-  'byte',
-  'comparable',
-  'complex128',
-  'complex64',
-  'error',
-  'float32',
-  'float64',
-  'int',
-  'int16',
-  'int32',
-  'int64',
-  'int8',
-  'rune',
-  'string',
-  'uint',
-  'uint16',
-  'uint32',
-  'uint64',
-  'uint8',
-  'uintptr',
-  'any',
-]);
-
-function inferPackageName(sourceText: string): string | null {
-  const match = sourceText.match(/^\s*package\s+([A-Za-z_][A-Za-z0-9_]*)/m);
-  return match?.[1] ?? null;
-}
 
 export function emitGoScopeCaptures(
   sourceText: string,
@@ -56,7 +30,6 @@ export function emitGoScopeCaptures(
 
   const rawMatches = getGoScopeQuery().matches(tree.rootNode);
   const out: CaptureMatch[] = [];
-  const pkgName = inferPackageName(sourceText);
 
   for (const m of rawMatches) {
     const grouped: Record<string, Capture> = {};
@@ -88,6 +61,8 @@ export function emitGoScopeCaptures(
         if (receiver !== null) out.push(receiver);
       }
     }
+
+    if (isRawMultiAssignTypeBinding(tree.rootNode, grouped)) continue;
 
     const declAnchor = grouped['@declaration.function'] ?? grouped['@declaration.method'];
     if (declAnchor !== undefined) {
@@ -167,38 +142,27 @@ export function emitGoScopeCaptures(
     });
   }
 
-  // Qualify same-package return-type captures: strip wrapper types
-  // (`*`, `[]`, etc.) first, then prepend `pkg.` so the rawName
-  // matches the qualified name we stamped on declarations.
-  // Cross-package types (`*models.User`) already carry a dot and are
-  // left as-is.
-  if (pkgName !== null) {
-    for (let i = 0; i < out.length; i++) {
-      const match = out[i]!;
-      if (match['@type-binding.return'] === undefined) continue;
-      const typeCap = match['@type-binding.type'];
-      if (typeCap === undefined || typeCap.text.includes('.')) continue;
-      let raw = typeCap.text.trim();
-      while (raw.startsWith('*')) raw = raw.slice(1).trim();
-      if (raw.startsWith('[]')) raw = raw.slice(2).trim();
-      // Strip chan prefix so element type gets qualified:
-      //   chan Event → pkg.Event (correct for cross-receiver dispatch)
-      //   chan int   → excluded by GO_BUILTIN_TYPES below (no phantom pkg.int)
-      if (raw.startsWith('chan ')) raw = raw.slice(5).trim();
-      if (raw.includes('.') || raw.startsWith('func(') || raw.startsWith('map[')) continue;
-      if (GO_BUILTIN_TYPES.has(raw)) continue;
-      const idx = raw.indexOf('[');
-      if (idx !== -1) raw = raw.slice(0, idx);
-      out[i] = {
-        ...match,
-        '@type-binding.type': {
-          name: '@type-binding.type',
-          text: pkgName + '.' + raw,
-          range: { ...typeCap.range },
-        },
-      };
-    }
-  }
-
   return out;
+}
+
+function isRawMultiAssignTypeBinding(
+  rootNode: SyntaxNode,
+  grouped: Record<string, Capture>,
+): boolean {
+  const anchor =
+    grouped['@type-binding.constructor'] ??
+    grouped['@type-binding.call-return'] ??
+    grouped['@type-binding.assertion'];
+  if (anchor === undefined) return false;
+
+  const node = findNodeAtRange(rootNode, anchor.range, 'short_var_declaration');
+  if (node === null) return false;
+  const lhs = node.childForFieldName('left');
+  const rhs = node.childForFieldName('right');
+  if (lhs === null) return false;
+  if (rhs === null) return false;
+  return (
+    lhs.namedChildren.filter((c) => c.type === 'identifier').length >= 2 &&
+    rhs.namedChildren.length >= 2
+  );
 }

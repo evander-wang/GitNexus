@@ -1,7 +1,7 @@
 import type { ParsedFile } from 'gitnexus-shared';
 import { SupportedLanguages } from 'gitnexus-shared';
 import { buildMro, defaultLinearize } from '../../scope-resolution/passes/mro.js';
-import { populateGoOwners } from './method-owners.js';
+import { populateGoOwners, populateGoWorkspaceOwners } from './method-owners.js';
 import type { ScopeResolver } from '../../scope-resolution/contract/scope-resolver.js';
 import { loadGoModulePath } from '../../language-config.js';
 import { goProvider } from '../go.js';
@@ -36,6 +36,7 @@ export const goScopeResolver: ScopeResolver = {
     buildMro(graph, parsedFiles, nodeLookup, defaultLinearize),
 
   populateOwners: (parsed: ParsedFile) => populateGoOwners(parsed),
+  populateWorkspaceOwners: (parsedFiles, ctx) => populateGoWorkspaceOwners(parsedFiles, ctx),
 
   isSuperReceiver: () => false,
 

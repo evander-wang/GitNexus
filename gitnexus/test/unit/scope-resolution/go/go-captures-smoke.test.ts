@@ -5,6 +5,23 @@ const tagNames = (matches: readonly Record<string, unknown>[]) =>
   matches.flatMap((m) => Object.keys(m));
 
 describe('Go scope captures — smoke', () => {
+  it('emits grouped imports once per import spec', () => {
+    const src = `
+package main
+
+import (
+  "fmt"
+  "os"
+)
+`;
+    const matches = emitGoScopeCaptures(src, 'main.go');
+    const imports = matches
+      .filter((m) => m['@import.source'] !== undefined)
+      .map((m) => m['@import.source']!.text);
+
+    expect(imports).toEqual(['fmt', 'os']);
+  });
+
   it('emits module, struct, interface, function, method, import, call, read, write captures', () => {
     const src = `
 package main
