@@ -48,6 +48,8 @@ export const goScopeResolver: ScopeResolver = {
 
   populateNamespaceSiblings: populateGoPackageSiblings,
   mirrorNamespaceTypeBindings: mirrorGoNamespaceTypeBindings,
+  // Staged/V2: registered but not yet wired in run.ts — method-name-only
+  // matching produces false IMPLEMENTS edges; awaits signature-level comparison.
   detectInterfaceImplementations: detectGoInterfaceImplementations,
   populateRangeBindings: populateGoRangeBindings,
 };
