@@ -44,7 +44,8 @@ export function expandGoDotImports(
 
       for (const [name, refs] of targetBindings) {
         if (name.length === 0) continue;
-        // Only exported names (uppercase first char — Go convention).
+        // V1: ASCII-only export check; Unicode uppercase identifiers (e.g. Ñame)
+        // are not recognized as exported. Conforms to Go community convention.
         const first = name[0]!;
         if (first < 'A' || first > 'Z') continue;
 
@@ -85,6 +86,7 @@ export function expandGoWildcardNames(
   for (const def of target.localDefs) {
     const name = simpleName(def);
     if (name === '') continue;
+    // V1: ASCII-only export check; see expandGoDotImports for full note.
     const first = name[0]!;
     if (first < 'A' || first > 'Z') continue;
     if (!names.includes(name)) names.push(name);

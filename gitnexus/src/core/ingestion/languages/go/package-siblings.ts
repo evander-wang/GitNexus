@@ -3,6 +3,12 @@ import type { ScopeResolutionIndexes } from '../../model/scope-resolution-indexe
 
 import { expandGoDotImports } from './expand-wildcards.js';
 
+/**
+ * O(n²×d) where n = files per package, d = defs per file.
+ * Acceptable for V1 since Go packages are typically small (< 20 files).
+ * Future optimization: build a name→def inverted index per package to reduce
+ * to O(n×d).
+ */
 export function populateGoPackageSiblings(
   parsedFiles: readonly ParsedFile[],
   indexes: ScopeResolutionIndexes,

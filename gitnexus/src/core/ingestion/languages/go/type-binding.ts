@@ -68,6 +68,7 @@ export function synthesizeGoTypeBindings(rootNode: SyntaxNode): CaptureMatch[] {
         }
         if (fn?.type === 'identifier' && fn.text === 'make' && args !== null) {
           const sliceOrMap = args.namedChildren.find((c) =>
+            // V1: channel_type not handled — make(chan T) produces no typeBinding.
             ['slice_type', 'map_type'].includes(c.type),
           );
           if (sliceOrMap !== null) {
