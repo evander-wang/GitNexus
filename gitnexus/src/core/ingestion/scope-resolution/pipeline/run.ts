@@ -197,6 +197,13 @@ export function runScopeResolution(
 
   const tFinalize = PROF ? process.hrtime.bigint() : 0n;
 
+  // Cross-package namespace typeBinding mirroring. Runs before
+  // propagateImportedReturnTypes so the SCC-ordered pass sees the
+  // mirrored bindings.
+  if (provider.mirrorNamespaceTypeBindings !== undefined) {
+    provider.mirrorNamespaceTypeBindings(parsedFiles, indexes, workspaceIndex);
+  }
+
   // Cross-file return-type propagation (Contract Invariant I3 timing:
   // after finalize, before resolve). Split-timed separately so the
   // SCC-ordered pass's cost is observable (PR #1050 made this O(files)
@@ -209,6 +216,7 @@ export function runScopeResolution(
   if (provider.populateRangeBindings !== undefined) {
     provider.populateRangeBindings(parsedFiles, indexes, {
       fileContents: getFileContents(),
+      treeCache,
     });
   }
   const tPropagate = PROF ? process.hrtime.bigint() : 0n;

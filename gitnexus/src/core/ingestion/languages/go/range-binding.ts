@@ -1,11 +1,15 @@
 import type { ParsedFile, Scope, TypeRef } from 'gitnexus-shared';
 import type { ScopeResolutionIndexes } from '../../model/scope-resolution-indexes.js';
 import { getGoParser } from './query.js';
+import { getTreeSitterBufferSize } from '../../constants.js';
 
 export function populateGoRangeBindings(
   parsedFiles: readonly ParsedFile[],
   _indexes: ScopeResolutionIndexes,
-  ctx: { readonly fileContents: ReadonlyMap<string, string> },
+  ctx: {
+    readonly fileContents: ReadonlyMap<string, string>;
+    readonly treeCache?: { get(filePath: string): unknown };
+  },
 ): void {
   const parser = getGoParser();
 
@@ -13,7 +17,12 @@ export function populateGoRangeBindings(
     const sourceText = ctx.fileContents.get(parsed.filePath);
     if (sourceText === undefined) continue;
 
-    const tree = parser.parse(sourceText);
+    const cachedTree = ctx.treeCache?.get(parsed.filePath);
+    const tree =
+      (cachedTree as ReturnType<typeof parser.parse> | undefined) ??
+      parser.parse(sourceText, undefined, {
+        bufferSize: getTreeSitterBufferSize(sourceText),
+      });
     const moduleScope = parsed.scopes.find((s) => s.kind === 'Module');
     if (moduleScope === undefined) continue;
 

@@ -532,6 +532,23 @@ export interface ScopeResolver {
   ) => Map<string, string[]>;
 
   /**
+   * Optional: mirror typeBindings from namespace-import target modules
+   * into the importer's module scope. Languages like Go use namespace
+   * imports (`import "pkg"`) and need the target package's exported
+   * typeBindings visible in the importer's scope chain for cross-package
+   * return-type resolution (e.g. `x := pkg.NewUser(); x.Save()` needs
+   * `NewUser → User` mirrored from the target package). Runs after
+   * `populateNamespaceSiblings` and before `propagateImportedReturnTypes`
+   * so the SCC-ordered pass sees the mirrored bindings.
+   * Default: undefined (no namespace typeBinding mirroring).
+   */
+  readonly mirrorNamespaceTypeBindings?: (
+    parsedFiles: readonly ParsedFile[],
+    indexes: ScopeResolutionIndexes,
+    workspaceIndex: import('../../scope-resolution/workspace-index.js').WorkspaceResolutionIndex,
+  ) => void;
+
+  /**
    * Optional: bind for-range loop variables to their element/value types.
    * Languages like Go need to resolve `for _, v := range m` where `m` is
    * `map[K]V` — the variable `v` should bind to `V`. Runs after finalize,
@@ -542,6 +559,9 @@ export interface ScopeResolver {
   readonly populateRangeBindings?: (
     parsedFiles: readonly ParsedFile[],
     indexes: ScopeResolutionIndexes,
-    ctx: { readonly fileContents: ReadonlyMap<string, string> },
+    ctx: {
+      readonly fileContents: ReadonlyMap<string, string>;
+      readonly treeCache?: { get(filePath: string): unknown };
+    },
   ) => void;
 }

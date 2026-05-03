@@ -14,3 +14,4 @@ export { resolveGoImportTarget, type GoResolveContext } from './import-target.js
 export { populateGoPackageSiblings } from './package-siblings.js';
 export { populateGoRangeBindings } from './range-binding.js';
 export { detectGoInterfaceImplementations } from './interface-impls.js';
+export { mirrorGoNamespaceTypeBindings } from './namespace-mirror.js';

@@ -10,6 +10,7 @@ import {
   goMergeBindings,
   populateGoPackageSiblings,
   resolveGoImportTarget,
+  mirrorGoNamespaceTypeBindings,
 } from './index.js';
 import { detectGoInterfaceImplementations } from './interface-impls.js';
 import { populateGoRangeBindings } from './range-binding.js';
@@ -46,6 +47,7 @@ export const goScopeResolver: ScopeResolver = {
   allowGlobalFreeCallFallback: true,
 
   populateNamespaceSiblings: populateGoPackageSiblings,
+  mirrorNamespaceTypeBindings: mirrorGoNamespaceTypeBindings,
   detectInterfaceImplementations: detectGoInterfaceImplementations,
   populateRangeBindings: populateGoRangeBindings,
 };
