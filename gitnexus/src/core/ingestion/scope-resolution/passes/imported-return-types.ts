@@ -197,7 +197,7 @@ export function propagateImportedReturnTypes(
   }
 
   // Namespace-import mirroring: for languages with namespace-style
-  // imports (Go `import "pkg"`), mirror exported typeBindings from all
+  // imports (e.g. `import "pkg"`), mirror exported typeBindings from all
   // target files' module scopes into the importer's module scope. This
   // covers the cross-package case where `x := pkg.Func()` creates a
   // function-scope typeBinding `x → Func`, and the module-scope chain-
@@ -212,7 +212,7 @@ export function propagateImportedReturnTypes(
     if (moduleEdges === undefined) continue;
 
     // Collect namespace target files per localName (one namespace may
-    // expand to multiple files — e.g. Go multi-file packages).
+    // expand to multiple files — e.g. multi-file namespace-import packages).
     const nsTargets = new Map<string, string[]>();
     for (const edge of moduleEdges) {
       if (edge.kind !== 'namespace' || edge.targetFile === null) continue;

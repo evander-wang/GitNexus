@@ -29,6 +29,9 @@ export function splitGoImportStatement(node: SyntaxNode): CaptureMatch[] {
   const kind =
     alias === '.' ? 'dot' : alias === '_' ? 'blank' : alias === undefined ? 'namespace' : 'alias';
 
+  // Blank imports (import _ "pkg") are dropped in V1 — they represent
+  // side-effect registrations (e.g. database drivers), but emitting
+  // side-effect edges is deferred. See test: go-imports.test.ts.
   if (kind === 'blank') return [];
 
   const aliased = alias !== undefined && alias !== '.' && alias !== '_';
