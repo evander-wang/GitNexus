@@ -10,7 +10,7 @@ export function interpretGoImport(captures: CaptureMatch): ParsedImport | null {
   if (kind === 'dot') return { kind: 'wildcard', targetRaw: source };
   if (kind === 'alias') {
     if (alias === undefined || name === undefined) return null;
-    return { kind: 'alias', localName: alias, importedName: name, alias, targetRaw: source };
+    return { kind: 'namespace', localName: alias, importedName: name, targetRaw: source };
   }
   if (kind === 'namespace') {
     if (name === undefined) return null;

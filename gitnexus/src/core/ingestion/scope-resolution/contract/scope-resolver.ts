@@ -396,6 +396,18 @@ export interface ScopeResolver {
   populateOwners(parsed: ParsedFile): void;
 
   /**
+   * Optional workspace-wide ownership reconciliation for languages whose
+   * member owner can be declared in a different file from the owner type.
+   * Runs after every file has had `populateOwners(parsed)` applied, but
+   * still before `reconcileOwnership`, so stamped ownerIds are copied into
+   * the semantic model registries.
+   */
+  readonly populateWorkspaceOwners?: (
+    parsedFiles: readonly ParsedFile[],
+    ctx: { readonly fileContents: ReadonlyMap<string, string> },
+  ) => void;
+
+  /**
    * Recognize a `super(...)`-style receiver text. Python returns
    * `/^super\s*\(/.test(t)`. Java returns `t === 'super'`. C++ may
    * also need `this` capture. Languages without inheritance return

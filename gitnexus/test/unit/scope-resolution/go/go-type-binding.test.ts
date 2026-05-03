@@ -67,6 +67,19 @@ describe('Go type binding synthesis — 7 patterns', () => {
     expect(qMatch).toBeDefined();
   });
 
+  it('keeps multi-assignment constructor bindings aligned with RHS positions', () => {
+    const src = 'package main\nfunc main() {\n  a, b := 42, X{}\n}';
+    const bindings = emitGoScopeCaptures(src, 'main.go')
+      .filter((m) => m['@type-binding.name'] !== undefined)
+      .map((m) => ({
+        name: m['@type-binding.name']!.text,
+        type: m['@type-binding.type']!.text,
+      }));
+
+    expect(bindings).toContainEqual({ name: 'b', type: 'X' });
+    expect(bindings).not.toContainEqual({ name: 'a', type: 'X' });
+  });
+
   it('interprets assertion type binding', () => {
     const result = interpretGoTypeBinding({
       '@type-binding.assertion': {

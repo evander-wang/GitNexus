@@ -11,18 +11,18 @@ export function synthesizeGoTypeBindings(rootNode: SyntaxNode): CaptureMatch[] {
     if (lhs === null) continue;
 
     // Multi-assignment: pair LHS identifiers positionally with RHS
-    // composite_literals or call_expressions. The tree-sitter query
-    // produces all combinations; these correct pairings overwrite them.
+    // expressions. The tree-sitter query produces all LHS/RHS
+    // combinations; emit only the positions whose RHS carries an
+    // inferable type.
     const lhsIds = lhs.namedChildren.filter((c) => c.type === 'identifier');
-    const rhsExprs = right.namedChildren.filter(
-      (c) => c.type === 'composite_literal' || c.type === 'call_expression',
-    );
+    const rhsExprs = right.namedChildren;
     if (lhsIds.length >= 2 && rhsExprs.length >= 2) {
       for (let i = 0; i < Math.min(lhsIds.length, rhsExprs.length); i++) {
         const lhsId = lhsIds[i]!;
         const rhsExpr = rhsExprs[i]!;
         const typeNode = extractTypeNode(rhsExpr);
-        const typeName = typeNode ? extractSimpleTypeNameText(typeNode) : rhsExpr.text;
+        if (typeNode === null) continue;
+        const typeName = extractSimpleTypeNameText(typeNode);
         out.push({
           '@type-binding.multi-assign': syntheticCapture(
             '@type-binding.multi-assign',
@@ -239,12 +239,46 @@ function extractTypeNode(expr: SyntaxNode): SyntaxNode | null {
       null
     );
   }
+  if (expr.type === 'unary_expression') {
+    const operand = expr.childForFieldName('operand');
+    return operand === null ? null : extractTypeNode(operand);
+  }
   if (expr.type === 'call_expression') {
     const fn = expr.childForFieldName('function');
+    if (fn?.type === 'identifier' && fn.text === 'new') {
+      const args = expr.childForFieldName('arguments');
+      return (
+        args?.namedChildren.find((c) =>
+          ['type_identifier', 'qualified_type', 'pointer_type'].includes(c.type),
+        ) ?? null
+      );
+    }
+    if (fn?.type === 'identifier' && fn.text === 'make') {
+      const args = expr.childForFieldName('arguments');
+      const container = args?.namedChildren.find((c) =>
+        ['slice_type', 'map_type'].includes(c.type),
+      );
+      if (container?.type === 'slice_type') {
+        return (
+          container.namedChildren.find((c) =>
+            ['type_identifier', 'qualified_type'].includes(c.type),
+          ) ?? null
+        );
+      }
+      if (container?.type === 'map_type') {
+        const typeChildren = container.namedChildren.filter((c) =>
+          ['type_identifier', 'qualified_type'].includes(c.type),
+        );
+        return typeChildren[1] ?? typeChildren[0] ?? null;
+      }
+    }
     if (fn?.type === 'identifier') return fn;
     if (fn?.type === 'selector_expression') {
       return fn.childForFieldName('field') ?? fn;
     }
+  }
+  if (expr.type === 'type_assertion_expression') {
+    return expr.childForFieldName('type');
   }
   return null;
 }

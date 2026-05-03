@@ -90,6 +90,14 @@ export function runScopeResolution(
   const onWarn = input.onWarn ?? (() => {});
   const PROF = process.env.PROF_SCOPE_RESOLUTION === '1';
   const tStart = PROF ? process.hrtime.bigint() : 0n;
+  let fileContents: Map<string, string> | undefined;
+  const getFileContents = (): Map<string, string> => {
+    if (fileContents === undefined) {
+      fileContents = new Map<string, string>();
+      for (const f of files) fileContents.set(f.path, f.content);
+    }
+    return fileContents;
+  };
 
   // ── Phase 1: extract each file → ParsedFile ────────────────────────────
   const parsedFiles: ParsedFile[] = [];
@@ -111,6 +119,7 @@ export function runScopeResolution(
     provider.populateOwners(parsed);
     parsedFiles.push(parsed);
   }
+  provider.populateWorkspaceOwners?.(parsedFiles, { fileContents: getFileContents() });
 
   // Reconcile scope-resolution's ownership view into the SemanticModel.
   // See `reconcile-ownership.ts` for the full rationale (Contract
@@ -179,15 +188,6 @@ export function runScopeResolution(
   // class bindings when chasing return-type chains across files.
   // The hook writes to `bindingAugmentations` only; finalized
   // `indexes.bindings` remains immutable post-finalize (I8).
-  let fileContents: Map<string, string> | undefined;
-  const getFileContents = (): Map<string, string> => {
-    if (fileContents === undefined) {
-      fileContents = new Map<string, string>();
-      for (const f of files) fileContents.set(f.path, f.content);
-    }
-    return fileContents;
-  };
-
   if (provider.populateNamespaceSiblings !== undefined) {
     provider.populateNamespaceSiblings(parsedFiles, indexes, {
       fileContents: getFileContents(),

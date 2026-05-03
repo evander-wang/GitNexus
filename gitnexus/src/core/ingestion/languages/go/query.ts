@@ -59,7 +59,6 @@ const GO_SCOPE_QUERY = `
   left: (expression_list (identifier) @declaration.name)) @declaration.variable
 
 ;; Imports
-(import_declaration) @import.statement
 (import_spec) @import.statement
 
 ;; Type bindings — parameter annotations
