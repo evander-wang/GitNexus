@@ -68,6 +68,10 @@ export function emitFreeCallFallback(
       if (fnDef === undefined) {
         fnDef = findCallableBindingInScope(site.inScope, site.name, scopes);
       }
+      // V1: pickUniqueGlobalCallable ignores import context — resolves to any
+      // globally-unique callable. False cross-package edges are possible when
+      // the caller does not import the target package. Same-package calls are
+      // caught by findCallableBindingInScope above before reaching here.
       if (fnDef === undefined && options.allowGlobalFallback === true) {
         fnDef = pickUniqueGlobalCallable(site.name, model, scopes);
       }

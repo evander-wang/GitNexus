@@ -14,15 +14,19 @@ export function populateGoPackageSiblings(
   indexes: ScopeResolutionIndexes,
   ctx: { readonly fileContents: ReadonlyMap<string, string> },
 ): void {
-  // 0. Expand dot imports first so subsequent same-package sibling
-  //    augmentation can also see dot-imported names.
-  expandGoDotImports(parsedFiles, indexes);
+  // 0. Filter out test files — Go _test.go files should not contribute
+  //    same-package sibling bindings to non-test files.
+  const nonTestFiles = parsedFiles.filter((f) => !f.filePath.endsWith('_test.go'));
 
-  // 1. Group files by package directory plus package name. Go package
+  // 1. Expand dot imports first so subsequent same-package sibling
+  //    augmentation can also see dot-imported names.
+  expandGoDotImports(nonTestFiles, indexes);
+
+  // 2. Group files by package directory plus package name. Go package
   //    identity is directory-scoped; repeated `package main` directories
   //    must not see each other's unqualified names.
   const packageByFile = new Map<string, string>();
-  for (const parsed of parsedFiles) {
+  for (const parsed of nonTestFiles) {
     const pkgName = inferPackageName(ctx.fileContents.get(parsed.filePath) ?? '');
     if (pkgName !== null) {
       packageByFile.set(parsed.filePath, `${packageDir(parsed.filePath)}\0${pkgName}`);
@@ -30,7 +34,7 @@ export function populateGoPackageSiblings(
   }
 
   const filesByPackage = new Map<string, { filePath: string; defs: SymbolDefinition[] }[]>();
-  for (const parsed of parsedFiles) {
+  for (const parsed of nonTestFiles) {
     const pkgName = packageByFile.get(parsed.filePath);
     if (pkgName === undefined) continue;
     const list = filesByPackage.get(pkgName) ?? [];
